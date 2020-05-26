@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <osquery/tables.h>
@@ -50,7 +48,7 @@ class PciDB {
    *
    * @return an instance of Status, indicating success or failure.
    */
-  Status getVendorName(const std::string& vendor_id, std::string& vendor);
+  Status getVendorName(const std::string& vendor_id, std::string& vendor) const;
 
   /**
    * @brief retrieves PCI device model description from pci.ids database.
@@ -64,7 +62,7 @@ class PciDB {
    */
   Status getModel(const std::string& vendor_id,
                   const std::string& model_id,
-                  std::string& model);
+                  std::string& model) const;
 
   /**
    * @brief retrieves PCI device subsystem description from pci.ids database.
@@ -82,7 +80,7 @@ class PciDB {
                           const std::string& model_id,
                           const std::string& subsystem_vendor_id,
                           const std::string& subsystem_device_id,
-                          std::string& subsystem);
+                          std::string& subsystem) const;
 
  public:
   PciDB(std::istream& db_filestream);
@@ -115,5 +113,17 @@ class PciDB {
  private:
   std::unordered_map<std::string, PciVendor> db_;
 };
+
+/// Extracts PCI device information into row for provided sysFS attributes.
+Status extractVendorModelFromPciDBIfPresent(
+    Row& row,
+    const std::string& device_ids_attr,
+    const std::string& subsystem_ids_attr,
+    const PciDB& pcidb);
+
+///  Extracts PCI class identifier information into row for provided sysFs
+///  attribute.
+Status extractPCIClassIDAttrs(Row& row, std::string pci_class_attr);
+
 } // namespace tables
 } // namespace osquery

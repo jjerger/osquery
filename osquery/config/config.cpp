@@ -2,16 +2,15 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <algorithm>
 #include <chrono>
 #include <functional>
 #include <map>
+#include <queue>
 #include <string>
 #include <vector>
 
@@ -19,19 +18,20 @@
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/iterator/filter_iterator.hpp>
 
-#include <osquery/config.h>
+#include <osquery/config/config.h>
 #include <osquery/database.h>
 #include <osquery/events.h>
+#include <osquery/flagalias.h>
 #include <osquery/flags.h>
-#include <osquery/killswitch.h>
+#include <osquery/hashing/hashing.h>
 #include <osquery/logger.h>
 #include <osquery/packs.h>
 #include <osquery/registry.h>
+#include <osquery/system.h>
 #include <osquery/tables.h>
-
-#include "osquery/core/conversions.h"
-#include "osquery/core/flagalias.h"
-#include "osquery/core/hashing.h"
+#include <osquery/utils/conversions/split.h>
+#include <osquery/utils/conversions/tryto.h>
+#include <osquery/utils/system/time.h>
 
 namespace rj = rapidjson;
 
@@ -39,6 +39,11 @@ namespace osquery {
 namespace {
 /// Prefix to persist config data
 const std::string kConfigPersistencePrefix{"config_persistence."};
+
+/// Max depth that the JSON document representing the configuration can have
+const int kMaxConfigDepth = 32;
+/// Max size that the configuration, stripped from its comments, can have
+const int kMaxConfigSize = 1024 * 1024;
 
 using ConfigMap = std::map<std::string, std::string>;
 
@@ -71,7 +76,10 @@ CLI_FLAG(bool,
          false,
          "Check the format of an osquery config and exit");
 
-CLI_FLAG(bool, config_dump, false, "Dump the contents of the configuration");
+CLI_FLAG(bool,
+         config_dump,
+         false,
+         "Dump the contents of the configuration, then exit");
 
 CLI_FLAG(uint64,
          config_refresh,
@@ -356,6 +364,11 @@ void Config::addPack(const std::string& name,
     // "name": {pack-content} response similar to embedded pack content
     // within the configuration.
     for (const auto& pack : obj.GetObject()) {
+      if (!pack.value.IsObject()) {
+        LOG(WARNING) << "Error parsing pack: " << pack.name.GetString()
+                     << ": the value should be an object";
+        continue;
+      }
       addSinglePack(pack.name.GetString(), pack.value);
     }
   } else {
@@ -471,19 +484,15 @@ Status Config::refresh() {
     }
 
     loaded_ = true;
-    if (Killswitch::get().isConfigBackupEnabled()) {
-      if (FLAGS_config_enable_backup && is_first_time_refresh.exchange(false)) {
-        const auto result = restoreConfigBackup();
-        if (!result) {
-          return Status::failure(result.getError().getFullMessageRecursive());
-        } else {
-          update(*result);
-        }
+    if (FLAGS_config_enable_backup && is_first_time_refresh.exchange(false)) {
+      LOG(INFO) << "Backing up configuration";
+      const auto result = restoreConfigBackup();
+      if (!result) {
+        return Status::failure(result.getError().getMessage());
+      } else {
+        update(*result);
       }
-    } else {
-      LOG(INFO) << "Config backup is disabled by the killswitch";
     }
-
     return status;
   } else if (getRefresh() != FLAGS_config_refresh) {
     VLOG(1) << "Normal configuration delay restored";
@@ -501,9 +510,10 @@ Status Config::refresh() {
                 content.first.c_str(),
                 content.second.c_str());
       }
+      VLOG(1) << "Requesting shutdown after dumping config";
       // Don't force because the config plugin may have started services.
       Initializer::requestShutdown();
-      return Status();
+      return Status::success();
     }
     status = update(response[0]);
   }
@@ -576,8 +586,8 @@ Expected<ConfigMap, Config::RestoreConfigError> Config::restoreConfigBackup() {
       LOG(ERROR)
           << "restoreConfigBackup database failed to retrieve config for key "
           << key;
-      return createError(Config::RestoreConfigError::DatabaseError,
-                         "Could not retrieve value for the key: " + key);
+      return createError(Config::RestoreConfigError::DatabaseError)
+             << "Could not retrieve value for the key: " << key;
     }
     config[key.substr(kConfigPersistencePrefix.length())] = std::move(value);
   }
@@ -605,6 +615,53 @@ void Config::backupConfig(const ConfigMap& config) {
   }
 }
 
+Status Config::validateConfig(const JSON& document) {
+  const auto& rapidjson_doc = document.doc();
+  if (!rapidjson_doc.IsObject()) {
+    return Status::failure(
+        "The root of the config JSON document has to be an Object");
+  }
+
+  const rapidjson::Value& root_node = rapidjson_doc;
+  std::queue<std::reference_wrapper<const rapidjson::Value>> nodes;
+  nodes.push(root_node);
+
+  std::size_t node_count = nodes.size();
+  int depth = 0;
+
+  while (node_count > 0 && depth < kMaxConfigDepth) {
+    while (node_count > 0) {
+      const auto& node = nodes.front().get();
+      nodes.pop();
+
+      if (node.IsObject()) {
+        for (rapidjson::Value::ConstMemberIterator itr = node.MemberBegin();
+             itr != node.MemberEnd();
+             ++itr) {
+          nodes.push(node[itr->name]);
+        }
+      } else if (node.IsArray()) {
+        for (size_t i = 0; i < node.Size(); ++i) {
+          nodes.push(node[i]);
+        }
+      }
+
+      --node_count;
+    }
+
+    ++depth;
+    node_count = nodes.size();
+  }
+
+  if (depth == kMaxConfigDepth && node_count != 0) {
+    return Status::failure(
+        "Configuration has too many "
+        "nesting levels!");
+  }
+
+  return Status::success();
+}
+
 Status Config::updateSource(const std::string& source,
                             const std::string& json) {
   // Compute a 'synthesized' hash using the content before it is parsed.
@@ -627,8 +684,24 @@ Status Config::updateSource(const std::string& source,
   auto clone = json;
   stripConfigComments(clone);
 
-  if (!doc.fromString(clone) || !doc.doc().IsObject()) {
-    return Status(1, "Error parsing the config JSON");
+  // Since we use iterative parsing, we limit the size of the JSON
+  // string to a sane value to avoid memory exhaustion.
+  if (clone.size() > kMaxConfigSize) {
+    return Status::failure(
+        "Error parsing the config JSON: the config size exceeds the limit "
+        "of " +
+        std::to_string(kMaxConfigSize) + " bytes");
+  }
+
+  if (!doc.fromString(clone, JSON::ParseMode::Iterative) ||
+      !doc.doc().IsObject()) {
+    return Status::failure("Error parsing the config JSON");
+  }
+
+  auto status = validateConfig(doc);
+  if (!status.ok()) {
+    return Status::failure("Error validating the config JSON: " +
+                           status.getMessage());
   }
 
   // extract the "schedule" key and store it as the main pack
@@ -661,7 +734,7 @@ Status Config::updateSource(const std::string& source,
   }
 
   applyParsers(source, doc.doc(), false);
-  return Status();
+  return Status::success();
 }
 
 Status Config::genPack(const std::string& name,
@@ -681,7 +754,7 @@ Status Config::genPack(const std::string& name,
   auto clone = response[0][name];
   if (clone.empty()) {
     LOG(WARNING) << "Error reading the query pack named: " << name;
-    return Status();
+    return Status::success();
   }
 
   stripConfigComments(clone);
@@ -692,7 +765,7 @@ Status Config::genPack(const std::string& name,
     addPack(name, source, doc.doc());
   }
 
-  return Status();
+  return Status::success();
 }
 
 void Config::applyParsers(const std::string& source,
@@ -700,19 +773,9 @@ void Config::applyParsers(const std::string& source,
                           bool pack) {
   assert(obj.IsObject());
 
-  // Iterate each parser.
-  RecursiveLock lock(config_schedule_mutex_);
-  for (const auto& plugin : RegistryFactory::get().plugins("config_parser")) {
-    std::shared_ptr<ConfigParserPlugin> parser = nullptr;
-    try {
-      parser = std::dynamic_pointer_cast<ConfigParserPlugin>(plugin.second);
-    } catch (const std::bad_cast& /* e */) {
-      LOG(ERROR) << "Error casting config parser plugin: " << plugin.first;
-    }
-    if (parser == nullptr || parser.get() == nullptr) {
-      continue;
-    }
-
+  auto applyParser = [=](const std::shared_ptr<ConfigParserPlugin>& parser,
+                         const std::string& source,
+                         const rj::Value& obj) {
     // For each key requested by the parser, add a property tree reference.
     std::map<std::string, JSON> parser_config;
     for (const auto& key : parser->keys()) {
@@ -724,13 +787,46 @@ void Config::applyParsers(const std::string& source,
         }
 
         auto doc = JSON::newFromValue(obj[key]);
-        parser_config.emplace(std::make_pair(key, std::move(doc)));
+        parser_config.emplace(key, std::move(doc));
       }
     }
     // The config parser plugin will receive a copy of each property tree for
     // each top-level-config key. The parser may choose to update the config's
     // internal state
     parser->update(source, parser_config);
+  };
+
+  auto getParser = [=](const PluginRef& plugin, const std::string& name) {
+    std::shared_ptr<ConfigParserPlugin> parser = nullptr;
+    try {
+      parser = std::dynamic_pointer_cast<ConfigParserPlugin>(plugin);
+    } catch (const std::bad_cast& /* e */) {
+      LOG(ERROR) << "Error casting config parser plugin: " << name;
+    }
+    return parser;
+  };
+
+  RecursiveLock lock(config_schedule_mutex_);
+  auto plugins = RegistryFactory::get().plugins("config_parser");
+
+  // Always apply the options parser first, others may depend on flags/options.
+  auto options_plugin = plugins.find("options");
+  if (options_plugin != plugins.end()) {
+    auto parser = getParser(options_plugin->second, options_plugin->first);
+    if (parser != nullptr && parser.get() != nullptr) {
+      applyParser(parser, source, obj);
+    }
+  }
+
+  // Iterate each parser.
+  for (const auto& plugin : plugins) {
+    if (plugin.first == "options") {
+      continue;
+    }
+    auto parser = getParser(plugin.second, plugin.first);
+    if (parser != nullptr && parser.get() != nullptr) {
+      applyParser(parser, source, obj);
+    }
   }
 }
 
@@ -813,7 +909,7 @@ Status Config::update(const ConfigMap& config) {
     backupConfig(config);
   }
 
-  return Status(0, "OK");
+  return Status::success();
 }
 
 void Config::purge() {
@@ -897,6 +993,7 @@ void Config::reset() {
       continue;
     }
     parser->reset();
+    parser->setUp();
   }
 }
 
@@ -910,7 +1007,6 @@ void ConfigParserPlugin::reset() {
 
 void Config::recordQueryPerformance(const std::string& name,
                                     size_t delay,
-                                    size_t size,
                                     const Row& r0,
                                     const Row& r1) {
   RecursiveLock lock(config_performance_mutex_);
@@ -950,7 +1046,6 @@ void Config::recordQueryPerformance(const std::string& name,
   }
 
   query.wall_time += delay;
-  query.output_size += size;
   query.executions += 1;
   query.last_executed = getUnixTime();
 
@@ -1012,7 +1107,7 @@ Status Config::genHash(std::string& hash) const {
   new_hash.update(buffer.data(), buffer.size());
   hash = new_hash.digest();
 
-  return Status(0, "OK");
+  return Status::success();
 }
 
 std::string Config::getHash(const std::string& source) const {
@@ -1061,7 +1156,7 @@ Status ConfigPlugin::call(const PluginRequest& request,
   }
 
   if (action->second == "genConfig") {
-    std::map<std::string, std::string> config;
+    ConfigMap config;
     auto stat = genConfig(config);
     response.push_back(config);
     return stat;
@@ -1092,7 +1187,7 @@ Status ConfigPlugin::call(const PluginRequest& request,
 
     response.push_back(
         {{"name", name->second}, {"value", Flag::getValue(name->second)}});
-    return Status();
+    return Status::success();
   }
   return Status(1, "Config plugin action unknown: " + action->second);
 }
@@ -1102,7 +1197,7 @@ Status ConfigParserPlugin::setUp() {
     auto obj = data_.getObject();
     data_.add(key, obj);
   }
-  return Status();
+  return Status::success();
 }
 
 void ConfigRefreshRunner::start() {
@@ -1120,4 +1215,4 @@ void ConfigRefreshRunner::start() {
     Config::get().refresh();
   }
 }
-}
+} // namespace osquery

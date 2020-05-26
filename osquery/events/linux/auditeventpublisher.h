@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #pragma once
@@ -17,8 +15,7 @@
 #include <boost/variant.hpp>
 
 #include <osquery/events.h>
-
-#include "osquery/events/linux/auditdnetlink.h"
+#include <osquery/events/linux/auditdnetlink.h>
 
 namespace osquery {
 
@@ -33,10 +30,15 @@ struct SyscallAuditEventData final {
   pid_t parent_process_id;
 
   uid_t process_uid;
+  uid_t process_auid;
   uid_t process_euid;
+  uid_t process_fsuid;
+  uid_t process_suid;
 
   gid_t process_gid;
   gid_t process_egid;
+  gid_t process_fsgid;
+  gid_t process_sgid;
 
   std::string executable_path;
 };

@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <map>
@@ -15,19 +13,24 @@
 #include <vector>
 
 #include <boost/algorithm/string/trim.hpp>
+#include <boost/optional.hpp>
 
 #include <osquery/core.h>
-#include <osquery/filesystem.h>
+#include <osquery/core/watcher.h>
+#include <osquery/extensions/interface.h>
+#include <osquery/filesystem/fileops.h>
+#include <osquery/filesystem/filesystem.h>
+#include <osquery/flagalias.h>
 #include <osquery/logger.h>
+#include <osquery/process/process.h>
 #include <osquery/registry.h>
+#include <osquery/sql.h>
 #include <osquery/system.h>
-
-#include "osquery/core/conversions.h"
-#include "osquery/core/flagalias.h"
-#include "osquery/core/process.h"
-#include "osquery/core/watcher.h"
-#include "osquery/extensions/interface.h"
-#include "osquery/filesystem/fileops.h"
+#include <osquery/utils/config/default_paths.h>
+#include <osquery/utils/conversions/join.h>
+#include <osquery/utils/conversions/split.h>
+#include <osquery/utils/info/platform_type.h>
+#include <osquery/utils/info/version.h>
 
 namespace fs = boost::filesystem;
 
@@ -95,6 +98,10 @@ EXTENSION_FLAG_ALIAS(interval, extensions_interval);
 class ExtensionWatcher : public InternalRunnable {
  public:
   virtual ~ExtensionWatcher() = default;
+  ExtensionWatcher(const std::string& path,
+                   size_t interval,
+                   bool fatal,
+                   RouteUUID uuid);
   ExtensionWatcher(const std::string& path, size_t interval, bool fatal);
 
  public:
@@ -117,6 +124,10 @@ class ExtensionWatcher : public InternalRunnable {
 
   /// If the ExtensionManager socket is closed, should the extension exit.
   bool fatal_;
+
+  /// Optional uuid used to monitor if socket is registered on with extension
+  /// core
+  boost::optional<RouteUUID> uuid_;
 };
 
 class ExtensionManagerWatcher : public ExtensionWatcher {
@@ -166,7 +177,7 @@ Status extensionPathActive(const std::string& path, bool use_timeout = false) {
         // Create a client with a 10-second receive timeout.
         ExtensionManagerClient client(path, 10 * 1000);
         auto status = client.ping();
-        return Status(0, "OK");
+        return Status::success();
       } catch (const std::exception& /* e */) {
         // Path might exist without a connected extension or extension manager.
       }
@@ -177,6 +188,14 @@ Status extensionPathActive(const std::string& path, bool use_timeout = false) {
     }
     return Status(1, "Extension socket not available: " + path);
   }));
+}
+
+ExtensionWatcher::ExtensionWatcher(const std::string& path,
+                                   size_t interval,
+                                   bool fatal,
+                                   RouteUUID uuid)
+    : ExtensionWatcher(path, interval, fatal) {
+  uuid_ = uuid;
 }
 
 ExtensionWatcher::ExtensionWatcher(const std::string& path,
@@ -235,9 +254,31 @@ void ExtensionWatcher::watch() {
   bool core_sane = true;
   if (socketExists(path_)) {
     try {
-      ExtensionManagerClient client(path_);
-      // Ping the extension manager until it goes down.
-      status = client.ping();
+      if (uuid_) {
+        // Check we are still registered with the osquery core by getting
+        // available extensions
+        ExtensionList extensionList;
+        status = getExtensions(extensionList);
+        if (status.getCode() != (int)ExtensionCode::EXT_SUCCESS && fatal_) {
+          LOG(ERROR) << "Extension watcher failed to get extensions: "
+                     << status.getMessage();
+          exitFatal();
+        } else if (extensionList.find(uuid_.get()) == extensionList.end() &&
+                   fatal_) {
+          LOG(ERROR) << "Extension not registered with osquery core";
+          exitFatal();
+        }
+      } else {
+        // Ping the extension manager to check it's still there
+        ExtensionManagerClient client(path_);
+        status = client.ping();
+        if (status.getCode() != (int)ExtensionCode::EXT_SUCCESS && fatal_) {
+          // The core may be healthy but return a failed ping status.
+          LOG(ERROR) << "Extension watcher ping failed: "
+                     << status.getMessage();
+          exitFatal();
+        }
+      }
     } catch (const std::exception& /* e */) {
       core_sane = false;
     }
@@ -247,13 +288,8 @@ void ExtensionWatcher::watch() {
   }
 
   if (!core_sane) {
-    VLOG(1) << "Extension watcher ending: osquery core has gone away";
+    LOG(INFO) << "Extension watcher ending: osquery core has gone away";
     exitFatal(0);
-  }
-
-  if (status.getCode() != (int)ExtensionCode::EXT_SUCCESS && fatal_) {
-    // The core may be healthy but return a failed ping status.
-    exitFatal();
   }
 }
 
@@ -310,6 +346,10 @@ void ExtensionManagerWatcher::watch() {
 }
 
 void initShellSocket(const std::string& homedir) {
+  if (FLAGS_disable_extensions) {
+    return;
+  }
+
   if (!Flag::isDefault("extensions_socket")) {
     return;
   }
@@ -428,7 +468,7 @@ Status loadExtensions(const std::string& loadfile) {
     // forking and executing the extension binary.
     Watcher::get().addExtensionPath(binary);
   }
-  return Status(0, "OK");
+  return Status::success();
 }
 
 Status startExtension(const std::string& name, const std::string& version) {
@@ -442,15 +482,7 @@ Status startExtension(const std::string& name,
   // When a broadcast is requested this registry should not send core plugins.
   RegistryFactory::get().setExternal();
 
-  // Latency converted to milliseconds, used as a thread interruptible.
-  auto latency = atoi(FLAGS_extensions_interval.c_str()) * 1000;
-  auto status = startExtensionWatcher(FLAGS_extensions_socket, latency, true);
-  if (!status.ok()) {
-    // If the threaded watcher fails to start, fail the extension.
-    return status;
-  }
-
-  status = startExtension(
+  auto status = startExtension(
       FLAGS_extensions_socket, name, version, min_sdk_version, kSDKVersion);
   if (!status.ok()) {
     // If the extension failed to start then the EM is most likely unavailable.
@@ -501,6 +533,16 @@ Status startExtension(const std::string& manager_path,
 
   // Now that the UUID is known, try to clean up stale socket paths.
   auto extension_path = getExtensionSocket(uuid, manager_path);
+
+  // Latency converted to milliseconds, used as a thread interruptible.
+  auto latency = atoi(FLAGS_extensions_interval.c_str()) * 1000;
+
+  // Register the watcher with it's uuid
+  status = startExtensionWatcher(manager_path, latency, true, uuid);
+  if (!status.ok()) {
+    // If the threaded watcher fails to start, fail the extension.
+    return status;
+  }
 
   status = socketExists(extension_path, true);
   if (!status) {
@@ -624,7 +666,7 @@ Status getExtensions(const std::string& manager_path,
                              ext.second.sdk_version};
   }
 
-  return Status(0, "OK");
+  return Status::success();
 }
 
 Status callExtension(const RouteUUID uuid,
@@ -662,7 +704,8 @@ Status callExtension(const std::string& extension_path,
 
 Status startExtensionWatcher(const std::string& manager_path,
                              size_t interval,
-                             bool fatal) {
+                             bool fatal,
+                             RouteUUID uuid) {
   // Make sure the extension manager path exists, and is writable.
   auto status = extensionPathActive(manager_path, true);
   if (!status.ok()) {
@@ -671,8 +714,8 @@ Status startExtensionWatcher(const std::string& manager_path,
 
   // Start a extension watcher, if the manager dies, so should we.
   Dispatcher::addService(
-      std::make_shared<ExtensionWatcher>(manager_path, interval, fatal));
-  return Status(0, "OK");
+      std::make_shared<ExtensionWatcher>(manager_path, interval, fatal, uuid));
+  return Status::success();
 }
 
 Status startExtensionManager() {
@@ -693,12 +736,20 @@ Status startExtensionManager(const std::string& manager_path) {
   // Seconds converted to milliseconds, used as a thread interruptible.
   auto latency = atoi(FLAGS_extensions_interval.c_str()) * 1000;
   // Start a extension manager watcher, to monitor all registered extensions.
-  Dispatcher::addService(
+  status = Dispatcher::addService(
       std::make_shared<ExtensionManagerWatcher>(manager_path, latency));
 
+  if (!status.ok()) {
+    return status;
+  }
+
   // Start the extension manager thread.
-  Dispatcher::addService(
+  status = Dispatcher::addService(
       std::make_shared<ExtensionManagerRunner>(manager_path));
+
+  if (!status.ok()) {
+    return status;
+  }
 
   // The shell or daemon flag configuration may require an extension.
   if (!FLAGS_extensions_require.empty()) {
@@ -719,7 +770,8 @@ Status startExtensionManager(const std::string& manager_path) {
           // If we have already waited for the timeout period, stop early.
           stop = true;
         }
-        return Status(1, "Extension not autoloaded: " + extension);
+        return Status(
+            1, "Required extension not found or not loaded: " + extension);
       }));
 
       // A required extension was not loaded.
@@ -731,6 +783,6 @@ Status startExtensionManager(const std::string& manager_path) {
     }
   }
 
-  return Status(0, "OK");
+  return Status::success();
 }
 } // namespace osquery

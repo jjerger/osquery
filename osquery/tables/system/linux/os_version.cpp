@@ -2,27 +2,27 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
+#include <cerrno>
+#include <sys/utsname.h>
+
 #include <map>
+#include <regex>
 #include <string>
 
 #include <boost/algorithm/string/find.hpp>
 #include <boost/algorithm/string/trim_all.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
-#include <boost/xpressive/xpressive.hpp>
-#include <osquery/filesystem.h>
+
+#include <osquery/filesystem/filesystem.h>
+#include <osquery/logger.h>
 #include <osquery/sql.h>
 #include <osquery/tables.h>
-
-#include "osquery/core/conversions.h"
-
-namespace xp = boost::xpressive;
+#include <osquery/utils/conversions/split.h>
 
 namespace osquery {
 namespace tables {
@@ -103,6 +103,14 @@ QueryData genOSVersion(QueryContext& context) {
     }
   }
 
+  struct utsname uname_buf {};
+
+  if (uname(&uname_buf) == 0) {
+    r["arch"] = TEXT(uname_buf.machine);
+  } else {
+    LOG(INFO) << "Failed to determine the OS architecture, error " << errno;
+  }
+
   std::string content;
   if (readFile(kRedhatRelease, content).ok()) {
     r["platform"] = "rhel";
@@ -117,16 +125,14 @@ QueryData genOSVersion(QueryContext& context) {
   boost::algorithm::trim_all(content);
 
   // This is an older version of a Redhat-based OS.
-  auto rx = xp::sregex::compile(
-      "(?P<name>[\\w+\\s]+) .* "
-      "(?P<major>[0-9]+)\\.(?P<minor>[0-9]+)\\.?(?P<patch>\\w+)?");
-  xp::smatch matches;
+  auto rx = std::regex("([\\w+\\s]+) .* ([0-9]+)\\.([0-9]+)\\.?(\\w+)?");
+  std::smatch matches;
   for (const auto& line : osquery::split(content, "\n")) {
-    if (xp::regex_search(line, matches, rx)) {
-      r["name"] = matches["name"];
-      r["major"] = matches["major"];
-      r["minor"] = matches["minor"];
-      r["patch"] = matches["patch"];
+    if (std::regex_search(line, matches, rx)) {
+      r["name"] = matches[1];
+      r["major"] = matches[2];
+      r["minor"] = matches[3];
+      r["patch"] = matches[4];
       if (r["patch"].empty()) {
         r["patch"] = "0";
       }

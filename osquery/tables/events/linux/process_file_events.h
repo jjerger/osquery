@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #pragma once
@@ -19,7 +17,7 @@
 
 #include <boost/variant.hpp>
 
-#include "osquery/events/linux/auditeventpublisher.h"
+#include <osquery/events/linux/auditeventpublisher.h>
 
 namespace osquery {
 /// An inode descriptor, containing the file (or folder) path
@@ -70,7 +68,7 @@ class AuditdFimFdMap final {
  public:
   AuditdFimFdMap(pid_t process_id);
 
-  /// Sets the new proces id that owns this fd map
+  /// Sets the new process id that owns this fd map
   void setProcessId(pid_t process_id);
 
   /// Returns a reference to the specified fd object
@@ -235,11 +233,26 @@ struct AuditdFimSyscallContext final {
   /// The process gid
   gid_t process_gid;
 
+  /// The process auid
+  uid_t process_auid;
+
   /// The process euid
   uid_t process_euid;
 
   /// The process egid
   gid_t process_egid;
+
+  /// The process fsuid
+  uid_t process_fsuid;
+
+  /// The process fsgid
+  gid_t process_fsgid;
+
+  /// The process suid
+  uid_t process_suid;
+
+  /// The process sgid
+  gid_t process_sgid;
 
   // Path of the executable that generated the event
   std::string executable_path;

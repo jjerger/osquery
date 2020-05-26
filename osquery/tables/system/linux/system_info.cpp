@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <thread>
@@ -15,13 +13,14 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/thread/thread.hpp>
 
-#include <osquery/filesystem.h>
+#include <osquery/filesystem/filesystem.h>
+#include <osquery/logger.h>
 #include <osquery/sql.h>
 #include <osquery/system.h>
 #include <osquery/tables.h>
+#include <osquery/tables/system/linux/smbios_utils.h>
+#include <osquery/utils/conversions/split.h>
 
-#include "osquery/core/conversions.h"
-#include "osquery/tables/system/linux/smbios_utils.h"
 
 namespace osquery {
 namespace tables {
@@ -101,15 +100,27 @@ QueryData genSystemInfo(QueryContext& context) {
                           uint8_t* address,
                           uint8_t* textAddrs,
                           size_t size) {
-        if (hdr->type != kSMBIOSTypeSystem || size < 0x12) {
+        if (size < 0x12) {
           return;
         }
 
-        auto maxlen = size - hdr->length;
-        r["hardware_vendor"] = dmiString(textAddrs, address[0x04], maxlen);
-        r["hardware_model"] = dmiString(textAddrs, address[0x05], maxlen);
-        r["hardware_version"] = dmiString(textAddrs, address[0x06], maxlen);
-        r["hardware_serial"] = dmiString(textAddrs, address[0x07], maxlen);
+        if (hdr->type == kSMBIOSTypeSystem) {
+          auto maxlen = size - hdr->length;
+          r["hardware_vendor"] = dmiString(textAddrs, address[0x04], maxlen);
+          r["hardware_model"] = dmiString(textAddrs, address[0x05], maxlen);
+          r["hardware_version"] = dmiString(textAddrs, address[0x06], maxlen);
+          r["hardware_serial"] = dmiString(textAddrs, address[0x07], maxlen);
+          return;
+        }
+
+        if (hdr->type == kSMBIOSTypeBoard) {
+          auto maxlen = size - hdr->length;
+          r["board_vendor"] = dmiString(textAddrs, address[0x04], maxlen);
+          r["board_model"] = dmiString(textAddrs, address[0x05], maxlen);
+          r["board_version"] = dmiString(textAddrs, address[0x06], maxlen);
+          r["board_serial"] = dmiString(textAddrs, address[0x07], maxlen);
+          return;
+        }
       }));
     }
   }

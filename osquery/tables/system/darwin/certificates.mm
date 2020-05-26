@@ -2,18 +2,18 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
+#include <openssl/opensslv.h>
+#include <openssl/x509.h>
+
 #include <osquery/core.h>
-#include <osquery/filesystem.h>
+#include <osquery/filesystem/filesystem.h>
 #include <osquery/logger.h>
 #include <osquery/sql.h>
-
-#include "osquery/tables/system/darwin/keychain.h"
+#include <osquery/tables/system/darwin/keychain.h>
 
 namespace osquery {
 namespace tables {
@@ -42,6 +42,9 @@ void genCertificate(X509* cert, const std::string& path, QueryData& results) {
   // so it should be called before others.
   r["ca"] = (CertificateIsCA(cert)) ? INTEGER(1) : INTEGER(0);
   r["self_signed"] = (CertificateIsSelfSigned(cert)) ? INTEGER(1) : INTEGER(0);
+
+// Temporary workaround for Buck compiling with an older openssl version
+#if OPENSSL_VERSION_NUMBER < 0x10101000L
   r["key_usage"] = genKeyUsage(cert->ex_kusage);
   r["authority_key_id"] =
       (cert->akid && cert->akid->keyid)
@@ -49,6 +52,17 @@ void genCertificate(X509* cert, const std::string& path, QueryData& results) {
           : "";
   r["subject_key_id"] =
       (cert->skid) ? genKIDProperty(cert->skid->data, cert->skid->length) : "";
+#else
+  r["key_usage"] = genKeyUsage(X509_get_key_usage(cert));
+
+  const auto* cert_key_id = X509_get0_authority_key_id(cert);
+  r["authority_key_id"] =
+      cert_key_id ? genKIDProperty(cert_key_id->data, cert_key_id->length) : "";
+
+  cert_key_id = X509_get0_subject_key_id(cert);
+  r["subject_key_id"] =
+      cert_key_id ? genKIDProperty(cert_key_id->data, cert_key_id->length) : "";
+#endif
 
   r["serial"] = genSerialForCertificate(cert);
 

@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <linux/audit.h>
@@ -18,15 +16,16 @@
 
 #include <boost/utility/string_ref.hpp>
 
+#include <osquery/events/linux/auditdnetlink.h>
+#include <osquery/events/linux/process_events.h>
+#include <osquery/events/linux/process_file_events.h>
+#include <osquery/events/linux/selinux_events.h>
+#include <osquery/events/linux/socket_events.h>
 #include <osquery/flags.h>
 #include <osquery/logger.h>
-
-#include "osquery/core/conversions.h"
-#include "osquery/events/linux/auditdnetlink.h"
-#include "osquery/tables/events/linux/process_events.h"
-#include "osquery/tables/events/linux/process_file_events.h"
-#include "osquery/tables/events/linux/selinux_events.h"
-#include "osquery/tables/events/linux/socket_events.h"
+#include <osquery/utils/conversions/tryto.h>
+#include <osquery/utils/expected/expected.h>
+#include <osquery/utils/system/time.h>
 
 namespace osquery {
 /// Control the audit subsystem by electing to be the single process sink.
@@ -34,12 +33,6 @@ FLAG(bool, audit_persist, true, "Attempt to retain control of audit");
 
 /// Audit debugger helper
 HIDDEN_FLAG(bool, audit_debug, false, "Debug Linux audit messages");
-
-/// Control the audit subsystem by allowing subscriptions to apply rules.
-FLAG(bool,
-     audit_allow_config,
-     false,
-     "Allow the audit publisher to change auditing configuration");
 
 /// Always uninstall all the audit rules that osquery uses when exiting
 FLAG(bool,
@@ -54,21 +47,31 @@ FLAG(bool,
      false,
      "Configure the audit subsystem from scratch");
 
+/// This value is passed directly to the audit API.
+FLAG(int32, audit_backlog_wait_time, 0, "The audit backlog wait time");
+
+/// This value is passed directly to the audit API.
+FLAG(int32, audit_backlog_limit, 4096, "The audit backlog limit");
+
 // External flags; they are used to determine which rules need to be installed
+DECLARE_bool(audit_allow_config);
 DECLARE_bool(audit_allow_fim_events);
 DECLARE_bool(audit_allow_process_events);
+DECLARE_bool(audit_allow_fork_process_events);
 DECLARE_bool(audit_allow_sockets);
 DECLARE_bool(audit_allow_user_events);
 DECLARE_bool(audit_allow_selinux_events);
 
-// user messages should be filtered
-// also, we should handle the 2nd user message type
 namespace {
 bool IsSELinuxRecord(const audit_reply& reply) noexcept {
-  static const auto& selinux_event_set = SELinuxEventSubscriber::GetEventSet();
+  static const auto& selinux_event_set = kSELinuxEventList;
   return (selinux_event_set.find(reply.type) != selinux_event_set.end());
 }
 
+/**
+ * User messages should be filtered. Also, we should handle the 2nd user
+ * message type.
+ */
 bool ShouldHandle(const audit_reply& reply) noexcept {
   if (IsSELinuxRecord(reply)) {
     return FLAGS_audit_allow_selinux_events;
@@ -146,7 +149,7 @@ void AuditdNetlinkReader::start() {
   while (!interrupted()) {
     if (auditd_context_->acquire_handle) {
       if (FLAGS_audit_debug) {
-        std::cout << "(re)acquiring the audit handle.." << std::endl;
+        VLOG(1) << "(Re)acquiring the audit handle";
       }
 
       NetlinkStatus netlink_status = acquireHandle();
@@ -196,7 +199,10 @@ void AuditdNetlinkReader::stop() {
   VLOG(1) << "Releasing the audit handle...";
 
   auditd_context_->unprocessed_records_cv.notify_all();
-  restoreAuditServiceConfiguration();
+
+  if (FLAGS_audit_allow_config) {
+    restoreAuditServiceConfiguration();
+  }
 
   audit_close(audit_netlink_handle_);
   audit_netlink_handle_ = -1;
@@ -304,8 +310,9 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
   // Want to set a min sane buffer and maximum number of events/second min.
   // This is normally controlled through the audit config, but we must
   // enforce sane minimums: -b 8192 -e 100
-  audit_set_backlog_wait_time(audit_netlink_handle_, 1);
-  audit_set_backlog_limit(audit_netlink_handle_, 4096);
+  audit_set_backlog_wait_time(audit_netlink_handle_,
+                              FLAGS_audit_backlog_wait_time);
+  audit_set_backlog_limit(audit_netlink_handle_, FLAGS_audit_backlog_limit);
   audit_set_failure(audit_netlink_handle_, AUDIT_FAIL_SILENT);
 
   // Request only the highest priority of audit status messages.
@@ -319,17 +326,27 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
   if (FLAGS_audit_allow_sockets) {
     VLOG(1) << "Enabling audit rules for the socket_events table";
 
-    for (int syscall : SocketEventSubscriber::GetSyscallSet()) {
+    for (int syscall : kSocketEventsSyscalls) {
       monitored_syscall_list_.insert(syscall);
     }
   }
 
   // Rules required by the process_events table
   if (FLAGS_audit_allow_process_events) {
-    VLOG(1) << "Enabling audit rules for the process_events table";
+    VLOG(1) << "Enabling audit rules for the process_events (execve, execveat) "
+               "table";
 
-    for (int syscall : AuditProcessEventSubscriber::GetSyscallSet()) {
+    for (int syscall : kExecProcessEventsSyscalls) {
       monitored_syscall_list_.insert(syscall);
+    }
+
+    if (FLAGS_audit_allow_fork_process_events) {
+      VLOG(1) << "Enabling audit rules for the process_events (fork, vfork, "
+                 "clone) table";
+
+      for (int syscall : kForkProcessEventsSyscalls) {
+        monitored_syscall_list_.insert(syscall);
+      }
     }
   }
 
@@ -337,7 +354,7 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
   if (FLAGS_audit_allow_fim_events) {
     VLOG(1) << "Enabling audit rules for the process_file_events table";
 
-    for (int syscall : ProcessFileEventSubscriber::GetSyscallSet()) {
+    for (int syscall : kProcessFileEventsSyscalls) {
       monitored_syscall_list_.insert(syscall);
     }
   }
@@ -361,8 +378,7 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
     // we have been asked to
     if (rule_add_error >= 0) {
       if (FLAGS_audit_debug) {
-        std::cout << "Audit rule installed for syscall " << syscall_number
-                  << std::endl;
+        VLOG(1) << "Audit rule installed for syscall " << syscall_number;
       }
 
       installed_rule_list_.push_back(rule);
@@ -370,8 +386,8 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
     }
 
     if (FLAGS_audit_debug) {
-      std::cout << "Audit rule for syscall " << syscall_number
-                << " could not be installed. Errno: " << (-errno) << std::endl;
+      VLOG(1) << "Audit rule for syscall " << syscall_number
+              << " could not be installed: " << (-errno);
     }
 
     if (FLAGS_audit_force_unconfigure) {
@@ -463,7 +479,7 @@ bool AuditdNetlinkReader::clearAuditConfiguration() noexcept {
     }
 
     // Save the rule
-    const auto reply_size = sizeof(reply) + reply.ruledata->buflen;
+    const auto reply_size = sizeof(audit_rule_data) + reply.ruledata->buflen;
 
     AuditRuleDataObject reply_object(reply_size);
 
@@ -538,10 +554,6 @@ bool AuditdNetlinkReader::deleteAuditRule(
 }
 
 void AuditdNetlinkReader::restoreAuditServiceConfiguration() noexcept {
-  if (FLAGS_audit_debug) {
-    std::cout << "Uninstalling audit rules" << std::endl;
-  }
-
   // Remove the rules we have added
   VLOG(1) << "Uninstalling the audit rules we have installed";
 
@@ -552,14 +564,7 @@ void AuditdNetlinkReader::restoreAuditServiceConfiguration() noexcept {
 
   installed_rule_list_.clear();
 
-  // Restore audit configuration defaults.
-  if (FLAGS_audit_debug) {
-    std::cout << "Restoring default settings and disabling the service"
-              << std::endl;
-  }
-
   VLOG(1) << "Restoring the default configuration for the audit service";
-
   audit_set_backlog_limit(audit_netlink_handle_, 0);
   audit_set_backlog_wait_time(audit_netlink_handle_, 60000);
   audit_set_failure(audit_netlink_handle_, AUDIT_FAIL_PRINTK);
@@ -630,15 +635,12 @@ NetlinkStatus AuditdNetlinkReader::acquireHandle() noexcept {
 
       return NetlinkStatus::Error;
     }
-
-    if (FLAGS_audit_debug) {
-      std::cout << "Audit service enabled" << std::endl;
-    }
   }
 
   if (FLAGS_audit_allow_config) {
     if (FLAGS_audit_force_reconfigure) {
       if (!clearAuditConfiguration()) {
+        audit_close(audit_netlink_handle_);
         audit_netlink_handle_ = -1;
         return NetlinkStatus::Error;
       }
@@ -646,10 +648,6 @@ NetlinkStatus AuditdNetlinkReader::acquireHandle() noexcept {
 
     if (!configureAuditService()) {
       return NetlinkStatus::ActiveImmutable;
-    }
-
-    if (FLAGS_audit_debug) {
-      std::cout << "Audit service configured" << std::endl;
     }
   }
 
@@ -748,8 +746,7 @@ bool AuditdNetlinkParser::ParseAuditReply(
   event_record = {};
 
   if (FLAGS_audit_debug) {
-    std::cout << reply.type << ", " << std::string(reply.message, reply.len)
-              << std::endl;
+    VLOG(1) << reply.type << ", " << std::string(reply.message, reply.len);
   }
 
   // Parse the record header

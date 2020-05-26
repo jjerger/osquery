@@ -2,25 +2,24 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <algorithm>
 #include <random>
 
-#include <osquery/core.h>
 #include <osquery/database.h>
+#include <osquery/hashing/hashing.h>
 #include <osquery/logger.h>
 #include <osquery/packs.h>
 #include <osquery/sql.h>
 #include <osquery/system.h>
-
-#include "osquery/core/conversions.h"
-#include "osquery/core/hashing.h"
-#include "osquery/core/json.h"
+#include <osquery/utils/conversions/split.h>
+#include <osquery/utils/conversions/tryto.h>
+#include <osquery/utils/info/version.h>
+#include <osquery/utils/json/json.h>
+#include <osquery/utils/system/time.h>
 
 namespace rj = rapidjson;
 
@@ -135,6 +134,13 @@ void Pack::initialize(const std::string& name,
     version_ = obj["version"].GetString();
   }
 
+  std::string oncall;
+  if (obj.HasMember("oncall") && obj["oncall"].IsString()) {
+    oncall = obj["oncall"].GetString();
+  } else {
+    oncall = "unknown";
+  }
+
   // Apply the shard, platform, and version checking.
   // It is important to set each value such that the packs meta-table can report
   // each of the restrictions.
@@ -146,7 +152,9 @@ void Pack::initialize(const std::string& name,
   discovery_queries_.clear();
   if (obj.HasMember("discovery") && obj["discovery"].IsArray()) {
     for (const auto& item : obj["discovery"].GetArray()) {
-      discovery_queries_.push_back(item.GetString());
+      if (item.IsString()) {
+        discovery_queries_.push_back(item.GetString());
+      }
     }
   }
 
@@ -168,8 +176,8 @@ void Pack::initialize(const std::string& name,
 
   // Iterate the queries (or schedule) and check platform/version/sanity.
   for (const auto& q : obj["queries"].GetObject()) {
-    if (!q.value.IsObject()) {
-      VLOG(1) << "The pack " << name << " must contain a dictionary of queries";
+    if (!q.value.IsObject() || !q.name.IsString()) {
+      VLOG(1) << "The pack " << name << " contains an invalid query";
       continue;
     }
 
@@ -197,13 +205,17 @@ void Pack::initialize(const std::string& name,
       continue;
     }
 
-    ScheduledQuery query;
-    query.query = q.value["query"].GetString();
+    ScheduledQuery query(
+        name_, q.name.GetString(), q.value["query"].GetString());
+
+    query.oncall = oncall;
+
     if (!q.value.HasMember("interval")) {
       query.interval = FLAGS_schedule_default_interval;
     } else {
       query.interval = JSON::valueToSize(q.value["interval"]);
     }
+
     if (query.interval <= 0 || query.query.empty() ||
         query.interval > kMaxQueryInterval) {
       // Invalid pack query.
@@ -271,10 +283,6 @@ const std::string& Pack::getName() const {
 
 const std::string& Pack::getSource() const {
   return source_;
-}
-
-void Pack::setName(const std::string& name) {
-  name_ = name;
 }
 
 bool Pack::checkPlatform() const {

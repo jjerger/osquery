@@ -2,21 +2,21 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #if !defined(WIN32)
 #include <sys/stat.h>
 #endif
 
-#include <osquery/filesystem.h>
+#include <osquery/filesystem/fileops.h>
+#include <osquery/filesystem/filesystem.h>
 #include <osquery/logger.h>
+#include <osquery/system.h>
 #include <osquery/tables.h>
-
-#include "osquery/filesystem/fileops.h"
+#include <osquery/worker/ipc/platform_table_container_ipc.h>
+#include <osquery/worker/logging/glog/glog_logger.h>
 
 namespace fs = boost::filesystem;
 
@@ -87,6 +87,7 @@ void genFileInfo(const fs::path& path,
 #if defined(__linux__)
   // No 'birth' or create time in Linux or Windows.
   r["btime"] = "0";
+  r["pid_with_namespace"] = "0";
 #else
   r["btime"] = BIGINT(file_stat.st_birthtimespec.tv_sec);
 #endif
@@ -99,6 +100,17 @@ void genFileInfo(const fs::path& path,
   } else {
     r["type"] = "unknown";
   }
+
+#if defined(__APPLE__)
+  std::string bsd_file_flags_description;
+  if (!describeBSDFileFlags(bsd_file_flags_description, file_stat.st_flags)) {
+    VLOG(1)
+        << "The following file had undocumented BSD file flags (chflags) set: "
+        << path;
+  }
+
+  r["bsd_flags"] = bsd_file_flags_description;
+#endif
 
 #else
 
@@ -127,13 +139,14 @@ void genFileInfo(const fs::path& path,
   r["attributes"] = TEXT(file_stat.attributes);
   r["file_id"] = TEXT(file_stat.file_id);
   r["volume_serial"] = TEXT(file_stat.volume_serial);
+  r["product_version"] = TEXT(file_stat.product_version);
 
 #endif
 
   results.push_back(r);
 }
 
-QueryData genFile(QueryContext& context) {
+QueryData genFileImpl(QueryContext& context, Logger& logger) {
   QueryData results;
 
   // Resolve file paths for EQUALS and LIKE operations.
@@ -196,6 +209,15 @@ QueryData genFile(QueryContext& context) {
   }
 
   return results;
+}
+
+QueryData genFile(QueryContext& context) {
+  if (hasNamespaceConstraint(context)) {
+    return generateInNamespace(context, "file", genFileImpl);
+  } else {
+    GLOGLogger logger;
+    return genFileImpl(context, logger);
+  }
 }
 }
 } // namespace osquery

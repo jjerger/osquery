@@ -2,23 +2,20 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
-#include <chrono>
+#include "tls.h"
 
-// clang-format off
-// This must be here to prevent a WinSock.h exists error
-#include "osquery/remote/transports/tls.h"
-// clang-format on
+#include <chrono>
+#include <osquery/core.h>
+#include <osquery/filesystem/filesystem.h>
+#include <osquery/utils/config/default_paths.h>
+#include <osquery/utils/info/platform_type.h>
+#include <osquery/utils/info/version.h>
 
 #include <boost/filesystem.hpp>
-
-#include <osquery/core.h>
-#include <osquery/filesystem.h>
 
 namespace fs = boost::filesystem;
 
@@ -62,7 +59,7 @@ CLI_FLAG(uint32,
          3600,
          "TLS session keep alive timeout in seconds");
 
-#if defined(DEBUG)
+#ifndef NDEBUG
 HIDDEN_FLAG(bool,
             tls_allow_unsafe,
             false,
@@ -76,7 +73,7 @@ HIDDEN_FLAG(bool, tls_node_api, false, "Use node key as TLS endpoints");
 
 DECLARE_bool(verbose);
 
-TLSTransport::TLSTransport() : verify_peer_(true) {
+TLSTransport::TLSTransport() {
   if (FLAGS_tls_server_certs.size() > 0) {
     server_certificate_file_ = FLAGS_tls_server_certs;
   }
@@ -95,7 +92,58 @@ void TLSTransport::decorateRequest(http::Request& r) {
 
 http::Client::Options TLSTransport::getOptions() {
   http::Client::Options options;
+
   options.follow_redirects(true).always_verify_peer(verify_peer_).timeout(16);
+
+  if (server_certificate_file_.size() > 0) {
+    if (!osquery::isReadable(server_certificate_file_).ok()) {
+      LOG(WARNING) << "Cannot read TLS server certificate(s): "
+                   << server_certificate_file_;
+    } else {
+      // There is a non-default server certificate set.
+      boost::system::error_code ec;
+
+      auto status = fs::status(server_certificate_file_, ec);
+
+#ifndef NDEBUG
+      if (!FLAGS_tls_allow_unsafe) {
+        // In unsafe mode we skip verification of the server's TLS details
+        // to allow people to connect to devservers
+#else
+      if (true) {
+#endif
+        options.openssl_verify_path(server_certificate_file_);
+      }
+
+      // On Windows, we cannot set openssl_certificate to a directory
+      if (isPlatform(PlatformType::TYPE_WINDOWS) &&
+          status.type() != fs::regular_file) {
+        LOG(WARNING) << "Cannot set a non-regular file as a certificate: "
+                     << server_certificate_file_;
+      } else {
+#ifndef NDEBUG
+        if (!FLAGS_tls_allow_unsafe) {
+#else
+        if (true) {
+#endif
+          options.openssl_certificate(server_certificate_file_);
+        }
+      }
+    }
+  }
+
+#ifndef NDEBUG
+  // Configuration may allow unsafe TLS testing if compiled as a debug target.
+  if (FLAGS_tls_allow_unsafe) {
+    options.always_verify_peer(false);
+  }
+#endif
+
+  return options;
+}
+
+http::Client::Options TLSTransport::getInternalOptions() {
+  auto options = getOptions();
 
   options.keep_alive(FLAGS_tls_session_reuse);
 
@@ -105,28 +153,6 @@ http::Client::Options TLSTransport::getOptions() {
 
   options.openssl_ciphers(kTLSCiphers);
   options.openssl_options(SSL_OP_NO_SSLv3 | SSL_OP_NO_SSLv2 | SSL_OP_ALL);
-
-  if (server_certificate_file_.size() > 0) {
-    if (!osquery::isReadable(server_certificate_file_).ok()) {
-      LOG(WARNING) << "Cannot read TLS server certificate(s): "
-                   << server_certificate_file_;
-    } else {
-      // There is a non-default server certificate set.
-      boost_system::error_code ec;
-
-      auto status = fs::status(server_certificate_file_, ec);
-      options.openssl_verify_path(server_certificate_file_);
-
-      // On Windows, we cannot set openssl_certificate to a directory
-      if (isPlatform(PlatformType::TYPE_WINDOWS) &&
-          status.type() != fs::regular_file) {
-        LOG(WARNING) << "Cannot set a non-regular file as a certificate: "
-                     << server_certificate_file_;
-      } else {
-        options.openssl_certificate(server_certificate_file_);
-      }
-    }
-  }
 
   if (client_certificate_file_.size() > 0) {
     if (!osquery::isReadable(client_certificate_file_).ok()) {
@@ -140,20 +166,6 @@ http::Client::Options TLSTransport::getOptions() {
       options.openssl_private_key_file(client_private_key_file_);
     }
   }
-
-  // 'Optionally', though all TLS plugins should set a hostname, supply an SNI
-  // hostname. This will reveal the requested domain.
-  auto it = options_.doc().FindMember("hostname");
-  if (it != options_.doc().MemberEnd() && it->value.IsString()) {
-    options.openssl_sni_hostname(it->value.GetString());
-  }
-
-#if defined(DEBUG)
-  // Configuration may allow unsafe TLS testing if compiled as a debug target.
-  if (FLAGS_tls_allow_unsafe) {
-    options.always_verify_peer(false);
-  }
-#endif
 
   return options;
 }
@@ -191,7 +203,8 @@ static auto getClient() {
 
 Status TLSTransport::sendRequest() {
   if (destination_.find("https://") == std::string::npos) {
-    return Status(1, "Cannot create TLS request for non-HTTPS protocol URI");
+    return Status::failure(
+        "Cannot create TLS request for non-HTTPS protocol URI");
   }
 
   http::Request r(destination_);
@@ -201,7 +214,7 @@ Status TLSTransport::sendRequest() {
   try {
     std::shared_ptr<http::Client> client = getClient();
 
-    client->setOptions(getOptions());
+    client->setOptions(getInternalOptions());
     response_ = client->get(r);
 
     const auto& response_body = response_.body();
@@ -211,15 +224,15 @@ Status TLSTransport::sendRequest() {
     response_status_ =
         serializer_->deserialize(response_body, response_params_);
   } catch (const std::exception& e) {
-    return Status((tlsFailure(e.what())) ? 2 : 1,
-                  std::string("Request error: ") + e.what());
+    return Status::failure(std::string("Request error: ") + e.what());
   }
   return response_status_;
 }
 
 Status TLSTransport::sendRequest(const std::string& params, bool compress) {
   if (destination_.find("https://") == std::string::npos) {
-    return Status(1, "Cannot create TLS request for non-HTTPS protocol URI");
+    return Status::failure(
+        "Cannot create TLS request for non-HTTPS protocol URI");
   }
 
   http::Request r(destination_);
@@ -245,7 +258,7 @@ Status TLSTransport::sendRequest(const std::string& params, bool compress) {
 
   try {
     std::shared_ptr<http::Client> client = getClient();
-    client->setOptions(getOptions());
+    client->setOptions(getInternalOptions());
 
     if (verb == HTTP_POST) {
       response_ = client->post(r, (compress) ? compressString(params) : params);
@@ -260,9 +273,8 @@ Status TLSTransport::sendRequest(const std::string& params, bool compress) {
     response_status_ =
         serializer_->deserialize(response_body, response_params_);
   } catch (const std::exception& e) {
-    return Status((tlsFailure(e.what())) ? 2 : 1,
-                  std::string("Request error: ") + e.what());
+    return Status::failure(std::string("Request error: ") + e.what());
   }
   return response_status_;
 }
-}
+} // namespace osquery

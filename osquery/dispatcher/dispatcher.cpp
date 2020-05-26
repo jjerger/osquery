@@ -2,24 +2,19 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <osquery/dispatcher.h>
 #include <osquery/flags.h>
 #include <osquery/logger.h>
-
-#include "osquery/core/conversions.h"
-#include "osquery/core/process.h"
+#include <osquery/process/process.h>
 
 namespace osquery {
 
 /// The worker_threads define the default thread pool size.
 FLAG(int32, worker_threads, 4, "Number of work dispatch threads");
-
 
 void InterruptableRunnable::interrupt() {
   // Set the service as interrupted.
@@ -69,25 +64,29 @@ Status Dispatcher::addService(InternalRunnableRef service) {
   }
 
   auto& self = instance();
-  if (self.stopping_) {
-    // Cannot add a service while the dispatcher is stopping and no joins
-    // have been requested.
-    return Status(1, "Cannot add service, dispatcher is stopping");
-  }
-
-  auto thread = std::make_unique<std::thread>(
-      std::bind(&InternalRunnable::run, &*service));
-
-  DLOG(INFO) << "Adding new service: " << service->name() << " ("
-             << service.get() << ") to thread: " << thread->get_id() << " ("
-             << thread.get() << ") in process " << platformGetPid();
   {
     WriteLock lock(self.mutex_);
+    if (self.stopping_) {
+      // Cannot add a service while the dispatcher is stopping and no joins
+      // have been requested.
+      return Status(1, "Cannot add service, dispatcher is stopping");
+    }
+
+    auto thread = std::make_unique<std::thread>(
+        std::bind(&InternalRunnable::run, &*service));
+    VLOG(1) << "Adding new service: " << service->name() << " ("
+            << service.get() << ") to thread: " << thread->get_id() << " ("
+            << thread.get() << ") in process " << platformGetPid();
 
     self.service_threads_.push_back(std::move(thread));
     self.services_.push_back(std::move(service));
   }
-  return Status(0, "OK");
+  return Status::success();
+}
+
+void Dispatcher::resetStopping() {
+  WriteLock lock(mutex_);
+  stopping_ = false;
 }
 
 void Dispatcher::removeService(const InternalRunnable* service) {
@@ -119,8 +118,7 @@ inline static void assureRun(const InternalRunnableRef& service) {
 
 void Dispatcher::joinServices() {
   auto& self = instance();
-  DLOG(INFO) << "Thread: " << std::this_thread::get_id()
-             << " requesting a join";
+  VLOG(1) << "Thread: " << std::this_thread::get_id() << " requesting a join";
 
   // Stops when service_threads_ is empty. Before stopping and releasing of the
   // lock, empties services_ .
@@ -138,25 +136,23 @@ void Dispatcher::joinServices() {
     }
     if (thread != nullptr) {
       thread->join();
-      DLOG(INFO) << "Service thread: " << thread.get() << " has joined";
+      VLOG(1) << "Service thread: " << thread.get() << " has joined";
     }
   }
 
-  self.stopping_ = false;
-  DLOG(INFO) << "Services and threads have been cleared";
+  VLOG(1) << "Services and threads have been cleared";
 }
 
 void Dispatcher::stopServices() {
   auto& self = instance();
-  self.stopping_ = true;
+  VLOG(1) << "Thread: " << std::this_thread::get_id() << " requesting a stop";
 
   WriteLock lock(self.mutex_);
-  DLOG(INFO) << "Thread: " << std::this_thread::get_id()
-             << " requesting a stop";
+  self.stopping_ = true;
   for (const auto& service : self.services_) {
     assureRun(service);
     service->interrupt();
-    DLOG(INFO) << "Service: " << service.get() << " has been interrupted";
+    VLOG(1) << "Service: " << service.get() << " has been interrupted";
   }
 }
 } // namespace osquery

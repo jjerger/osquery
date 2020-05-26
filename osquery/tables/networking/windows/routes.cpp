@@ -2,29 +2,31 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
-#include <memory>
-#include <string>
-#include <windows.h>
-#include <winsock2.h>
+#include <osquery/utils/system/system.h>
 
-#include <wS2tcpip.h>
-#include <ws2ipdef.h>
-
-#include <iphlpapi.h>
 #include <mstcpip.h>
+#include <wS2tcpip.h>
+#include <winsock2.h>
+// The following headers need to be included in this specific order
+// clang-format off
+#include <ws2def.h>
+#include <ws2ipdef.h>
+#include <iphlpapi.h>
+// clang-format on
 
 #include <boost/algorithm/string/join.hpp>
 #include <osquery/logger.h>
 #include <osquery/tables.h>
 
-#include "osquery/core/conversions.h"
+#include <osquery/utils/conversions/tryto.h>
 #include "osquery/core/windows/wmi.h"
+
+#include <memory>
+#include <string>
 
 namespace osquery {
 namespace tables {
@@ -112,16 +114,16 @@ QueryData genRoutes(QueryContext& context) {
       auto ipAddress = currentRow.DestinationPrefix.Prefix.Ipv6.sin6_addr;
       auto gateway = currentRow.NextHop.Ipv6.sin6_addr;
 
-      InetNtop(addrFamily, (PVOID)&ipAddress, buffer.data(), buffer.size());
+      InetNtopA(addrFamily, (PVOID)&ipAddress, buffer.data(), buffer.size());
       r["destination"] = SQL_TEXT(buffer.data());
-      InetNtop(addrFamily, (PVOID)&gateway, buffer.data(), buffer.size());
+      InetNtopA(addrFamily, (PVOID)&gateway, buffer.data(), buffer.size());
       r["gateway"] = SQL_TEXT(buffer.data());
     } else if (addrFamily == AF_INET) {
       std::vector<char> buffer(INET_ADDRSTRLEN);
       auto ipAddress = currentRow.DestinationPrefix.Prefix.Ipv4.sin_addr;
       auto gateway = currentRow.NextHop.Ipv4.sin_addr;
 
-      InetNtop(addrFamily, (PVOID)&ipAddress, buffer.data(), buffer.size());
+      InetNtopA(addrFamily, (PVOID)&ipAddress, buffer.data(), buffer.size());
       r["destination"] = SQL_TEXT(buffer.data());
       buffer.clear();
 
@@ -140,7 +142,7 @@ QueryData genRoutes(QueryContext& context) {
         }
       } else {
         interfaceIpAddress = "127.0.0.1";
-        InetNtop(addrFamily, (PVOID)&gateway, buffer.data(), buffer.size());
+        InetNtopA(addrFamily, (PVOID)&gateway, buffer.data(), buffer.size());
         r["gateway"] = SQL_TEXT(buffer.data());
         buffer.clear();
       }

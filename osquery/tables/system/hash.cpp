@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 // clang-format off
@@ -27,11 +25,16 @@
 #include <boost/filesystem.hpp>
 
 #include <osquery/flags.h>
-#include <osquery/filesystem.h>
-#include <osquery/tables.h>
+#include <osquery/filesystem/filesystem.h>
+#include <osquery/hashing/hashing.h>
 #include <osquery/logger.h>
-
-#include "osquery/core/hashing.h"
+#include <osquery/tables.h>
+#include <osquery/sql/dynamic_table_row.h>
+#include <osquery/utils/mutex.h>
+#include <osquery/utils/info/platform_type.h>
+#include <osquery/worker/ipc/platform_table_container_ipc.h>
+#include <osquery/worker/logging/glog/glog_logger.h>
+#include <osquery/worker/logging/logger.h>
 
 namespace osquery {
 
@@ -93,7 +96,7 @@ struct FileHashCache {
    *
    * @return true if succeeded, false if something went wrong.
    */
-  static bool load(const std::string& path, MultiHashes& out);
+  static bool load(const std::string& path, MultiHashes& out, Logger& logger);
 };
 
 #if defined(WIN32)
@@ -122,7 +125,9 @@ static inline bool statInvalid(const struct stat& st, const FileHashCache& fh) {
   return false;
 }
 
-bool FileHashCache::load(const std::string& path, MultiHashes& out) {
+bool FileHashCache::load(const std::string& path,
+                         MultiHashes& out,
+                         Logger& logger) {
   // synchronize the access to cache
   static Mutex mx;
   // path => cache entry
@@ -136,7 +141,7 @@ bool FileHashCache::load(const std::string& path, MultiHashes& out) {
   if (stat(path.c_str(), &st) != 0) {
     char buf[0x200] = {0};
     strerror_r(errno, buf, sizeof(buf));
-    LOG(WARNING) << "Cannot stat file: " << path << ": " << buf;
+    logger.log(google::GLOG_WARNING, "Cannot stat file: " + path + ": " + buf);
     return false;
   }
 
@@ -173,6 +178,7 @@ bool FileHashCache::load(const std::string& path, MultiHashes& out) {
     auto hashes = hashMultiFromFile(
         HASH_TYPE_MD5 | HASH_TYPE_SHA1 | HASH_TYPE_SHA256, path);
     entry->second.cache_access_time = time(nullptr);
+    entry->second.file_inode = st.st_ino;
     entry->second.file_mtime = st.st_mtime;
     entry->second.file_size = st.st_size;
     entry->second.hashes = std::move(hashes);
@@ -186,38 +192,38 @@ bool FileHashCache::load(const std::string& path, MultiHashes& out) {
   return true;
 }
 
-std::string genSsdeepForFile(const std::string& path) {
+Status genSsdeepForFile(const std::string& path, std::string& ssdeep_hash) {
 #ifdef OSQUERY_POSIX
-  std::string file_ssdeep_hash(FUZZY_MAX_RESULT, '\0');
+  ssdeep_hash.resize(FUZZY_MAX_RESULT, '\0');
   auto did_ssdeep_fail =
-      fuzzy_hash_filename(path.c_str(), &file_ssdeep_hash.front());
+      fuzzy_hash_filename(path.c_str(), &ssdeep_hash.front());
   if (did_ssdeep_fail) {
-    LOG(WARNING) << "ssdeep failed: " << path;
-    return "-1";
+    return Status::failure("ssdeep failed: " + path);
   }
-  file_ssdeep_hash.resize(file_ssdeep_hash.find('\0'));
-  return file_ssdeep_hash;
+  ssdeep_hash.resize(ssdeep_hash.find('\0'));
+  return Status::success();
 #else
-  return "-1";
+  ssdeep_hash = "-1";
+  return Status::success();
 #endif
 }
 
 void genHashForFile(const std::string& path,
                     const std::string& dir,
                     QueryContext& context,
-                    QueryData& results) {
+                    QueryData& results,
+                    Logger& logger) {
   // Must provide the path, filename, directory separate from boost path->string
   // helpers to match any explicit (query-parsed) predicate constraints.
-  Row r;
-
+  auto tr = TableRowHolder(new DynamicTableRow());
   MultiHashes hashes;
   if (!FLAGS_disable_hash_cache) {
-    FileHashCache::load(path, hashes);
+    FileHashCache::load(path, hashes, logger);
   } else {
     if (context.isCached(path)) {
       // Use the inner-query cache if the global hash cache is disabled.
       // This protects against hashing the same content twice in the same query.
-      r = context.getCache(path);
+      tr = context.getCache(path);
     } else {
       hashes = hashMultiFromFile(
           HASH_TYPE_MD5 | HASH_TYPE_SHA1 | HASH_TYPE_SHA256, path);
@@ -225,6 +231,7 @@ void genHashForFile(const std::string& path,
     }
   }
 
+  DynamicTableRow& r = *dynamic_cast<DynamicTableRow*>(tr.get());
   r["path"] = path;
   r["directory"] = dir;
   r["md5"] = std::move(hashes.md5);
@@ -232,14 +239,20 @@ void genHashForFile(const std::string& path,
   r["sha256"] = std::move(hashes.sha256);
 
   if (isPlatform(PlatformType::TYPE_POSIX) && context.isColumnUsed("ssdeep")) {
-    r["ssdeep"] = genSsdeepForFile(path);
+    auto status = genSsdeepForFile(path, r["ssdeep"]);
+
+    if (!status.ok()) {
+      logger.log(google::GLOG_WARNING, status.getMessage());
+    }
   }
 
   if (FLAGS_disable_hash_cache) {
-    context.setCache(path, r);
+    context.setCache(path, tr);
   }
 
-  results.push_back(std::move(r));
+  r["pid_with_namespace"] = "0";
+
+  results.push_back(static_cast<Row>(r));
 }
 
 void expandFSPathConstraints(QueryContext& context,
@@ -262,7 +275,7 @@ void expandFSPathConstraints(QueryContext& context,
       }));
 }
 
-QueryData genHash(QueryContext& context) {
+QueryData genHashImpl(QueryContext& context, Logger& logger) {
   QueryData results;
   boost::system::error_code ec;
 
@@ -279,7 +292,8 @@ QueryData genHash(QueryContext& context) {
       continue;
     }
 
-    genHashForFile(path_string, path.parent_path().string(), context, results);
+    genHashForFile(
+        path_string, path.parent_path().string(), context, results, logger);
   }
 
   // Now loop through constraints using the directory column constraint.
@@ -299,12 +313,21 @@ QueryData genHash(QueryContext& context) {
     for (; begin != end; ++begin) {
       if (boost::filesystem::is_regular_file(begin->path(), ec)) {
         genHashForFile(
-            begin->path().string(), directory_string, context, results);
+            begin->path().string(), directory_string, context, results, logger);
       }
     }
   }
 
   return results;
+}
+
+QueryData genHash(QueryContext& context) {
+  if (hasNamespaceConstraint(context)) {
+    return generateInNamespace(context, "hash", genHashImpl);
+  } else {
+    GLOGLogger logger;
+    return genHashImpl(context, logger);
+  }
 }
 } // namespace tables
 } // namespace osquery

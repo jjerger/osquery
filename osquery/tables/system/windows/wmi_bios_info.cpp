@@ -2,27 +2,25 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
+#include <regex>
 #include <string>
-
-#include <boost/algorithm/string.hpp>
-#include <boost/regex.hpp>
 
 #include <osquery/logger.h>
 #include <osquery/tables.h>
 
-#include "osquery/core/conversions.h"
-#include "osquery/core/windows/wmi.h"
+#include <osquery/utils/conversions/split.h>
+#include <osquery/utils/conversions/tryto.h>
+
+#include <osquery/core/windows/wmi.h>
 
 namespace osquery {
 namespace tables {
 
-const auto kHPBiosSettingRegex = boost::regex("\\*([\\w ]*)");
+const auto kHPBiosSettingRegex = std::regex("\\*([\\w ]*)");
 const std::vector<std::string> kHP = {
     "hp", "hewlett-packard", "hewlett packard"};
 const std::vector<std::string> kLenovo = {"lenovo"};
@@ -61,11 +59,11 @@ Row getHPBiosInfo(const WmiResultItem& item) {
   Row r;
 
   std::string value;
-  boost::smatch matches;
+  std::smatch matches;
   item.GetString("Name", r["name"]);
   item.GetString("Value", value);
 
-  if (boost::regex_search(value, matches, kHPBiosSettingRegex)) {
+  if (std::regex_search(value, matches, kHPBiosSettingRegex)) {
     r["value"] = std::string(matches[1]);
   } else {
     r["value"] = value;

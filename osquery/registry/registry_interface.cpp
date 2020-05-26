@@ -2,20 +2,17 @@
  *  Copyright (c) 2018-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <osquery/extensions.h>
 #include <osquery/registry_factory.h>
 #include <osquery/registry_interface.h>
-
-#include "osquery/core/conversions.h"
+#include <osquery/utils/conversions/split.h>
 
 namespace osquery {
-void RegistryInterface::remove(const std::string& item_name) {
+void RegistryInterface::removeUnsafe(const std::string& item_name) {
   if (items_.count(item_name) > 0) {
     items_[item_name]->tearDown();
     items_.erase(item_name);
@@ -32,6 +29,11 @@ void RegistryInterface::remove(const std::string& item_name) {
   for (const auto& alias : removed_aliases) {
     aliases_.erase(alias);
   }
+}
+
+void RegistryInterface::remove(const std::string& item_name) {
+  WriteLock lock(mutex_);
+  removeUnsafe(item_name);
 }
 
 bool RegistryInterface::isInternal(const std::string& item_name) const {
@@ -70,7 +72,7 @@ Status RegistryInterface::setActive(const std::string& item_name) {
   // Default support multiple active plugins.
   for (const auto& item : osquery::split(item_name, ",")) {
     if (items_.count(item) == 0 && external_.count(item) == 0) {
-      return Status(1, "Unknown registry plugin: " + item);
+      return Status::failure("Unknown registry plugin: " + item);
     }
   }
 
@@ -153,12 +155,12 @@ Status RegistryInterface::call(const std::string& item_name,
     } else if (routes_.count(item_name) > 0) {
       // The item has a route, but no extension, pass in the route info.
       response = routes_.at(item_name);
-      return Status(0, "Route only");
+      return Status::success();
     } else if (RegistryFactory::get().external()) {
       // If this is an extension's registry forward unknown calls to the core.
       uuid = 0;
     } else {
-      return Status(1, "Cannot call registry item: " + item_name);
+      return Status::failure("Cannot call registry item: " + item_name);
     }
   }
 
@@ -170,10 +172,10 @@ Status RegistryInterface::addAlias(const std::string& item_name,
   WriteLock lock(mutex_);
 
   if (aliases_.count(alias) > 0) {
-    return Status(1, "Duplicate alias: " + alias);
+    return Status::failure("Duplicate alias: " + alias);
   }
   aliases_[alias] = item_name;
-  return Status(0, "OK");
+  return Status::success();
 }
 
 std::string RegistryInterface::getAlias(const std::string& alias) const {
@@ -191,7 +193,7 @@ Status RegistryInterface::addPlugin(const std::string& plugin_name,
   WriteLock lock(mutex_);
 
   if (items_.count(plugin_name) > 0) {
-    return Status(1, "Duplicate registry item exists: " + plugin_name);
+    return Status::failure("Duplicate registry item exists: " + plugin_name);
   }
 
   plugin_item->setName(plugin_name);
@@ -202,11 +204,11 @@ Status RegistryInterface::addPlugin(const std::string& plugin_name,
     internal_.push_back(plugin_name);
   }
 
-  return Status(0, "OK");
+  return Status::success();
 }
 
 void RegistryInterface::setUp() {
-  ReadLock lock(mutex_);
+  UpgradeLock lock(mutex_);
 
   // If this registry does not auto-setup do NOT setup the registry items.
   if (!auto_setup_) {
@@ -229,8 +231,11 @@ void RegistryInterface::setUp() {
     }
   }
 
-  for (const auto& failed_item : failed) {
-    remove(failed_item);
+  {
+    WriteUpgradeLock wlock(lock);
+    for (const auto& failed_item : failed) {
+      removeUnsafe(failed_item);
+    }
   }
 }
 
@@ -266,20 +271,18 @@ Status RegistryInterface::addExternal(const RouteUUID& uuid,
     }
   }
 
-  return Status(0, "OK");
+  return Status::success();
 }
 
 /// Remove all the routes for a given uuid.
 void RegistryInterface::removeExternal(const RouteUUID& uuid) {
+  WriteLock lock(mutex_);
   std::vector<std::string> removed_items;
 
-  {
-    ReadLock rlock(mutex_);
-    // Create list of items to remove by filtering uuid
-    for (const auto& item : external_) {
-      if (item.second == uuid) {
-        removed_items.push_back(item.first);
-      }
+  // Create list of items to remove by filtering uuid
+  for (const auto& item : external_) {
+    if (item.second == uuid) {
+      removed_items.push_back(item.first);
     }
   }
 
@@ -287,13 +290,10 @@ void RegistryInterface::removeExternal(const RouteUUID& uuid) {
     removeExternalPlugin(item);
   }
 
-  {
-    WriteLock wlock(mutex_);
-    // Remove items belonging to the external uuid.
-    for (const auto& item : removed_items) {
-      external_.erase(item);
-      routes_.erase(item);
-    }
+  // Remove items belonging to the external uuid.
+  for (const auto& item : removed_items) {
+    external_.erase(item);
+    routes_.erase(item);
   }
 }
 
@@ -333,6 +333,8 @@ void RegistryInterface::setname(const std::string& name) {
 }
 
 bool RegistryInterface::isInternal_(const std::string& item_name) const {
+  ReadLock lock(mutex_);
+
   if (std::find(internal_.begin(), internal_.end(), item_name) ==
       internal_.end()) {
     return false;
@@ -342,6 +344,8 @@ bool RegistryInterface::isInternal_(const std::string& item_name) const {
 
 bool RegistryInterface::exists_(const std::string& item_name,
                                 bool local) const {
+  ReadLock lock(mutex_);
+
   bool has_local = (items_.count(item_name) > 0);
   bool has_external = (external_.count(item_name) > 0);
   bool has_route = (routes_.count(item_name) > 0);

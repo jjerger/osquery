@@ -2,14 +2,16 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include "osquery/sql/sqlite_util.h"
 #include "osquery/sql/virtual_table.h"
+
+#include <osquery/plugins/sql.h>
+
+#include <osquery/utils/conversions/castvariant.h>
 
 #include <osquery/core.h>
 #include <osquery/flags.h>
@@ -17,14 +19,21 @@
 #include <osquery/registry_factory.h>
 #include <osquery/sql.h>
 
+#include <osquery/utils/conversions/split.h>
+
 #include <boost/lexical_cast.hpp>
 
 namespace osquery {
 
 FLAG(string,
      disable_tables,
-     "Not Specified",
+     "",
      "Comma-delimited list of table names to be disabled");
+
+FLAG(string,
+     enable_tables,
+     "",
+     "Comma-delimited list of table names to be enabled");
 
 FLAG(string, nullvalue, "", "Set string for NULL values, default ''");
 
@@ -130,7 +139,7 @@ class SQLiteSQLPlugin : public SQLPlugin {
   Status attach(const std::string& name) override;
 
   /// Detach a virtual table (DROP).
-  void detach(const std::string& name) override;
+  Status detach(const std::string& name) override;
 };
 
 /// SQL provider for osquery internal/core.
@@ -173,7 +182,7 @@ Status SQLiteSQLPlugin::getQueryTables(const std::string& query,
 SQLInternal::SQLInternal(const std::string& query, bool use_cache) {
   auto dbc = SQLiteDBManager::get();
   dbc->useCache(use_cache);
-  status_ = queryInternal(query, results_, dbc);
+  status_ = queryInternal(query, resultsTyped_, dbc);
 
   // One of the advantages of using SQLInternal (aside from the Registry-bypass)
   // is the ability to "deep-inspect" the table attributes and actions.
@@ -182,8 +191,43 @@ SQLInternal::SQLInternal(const std::string& query, bool use_cache) {
   dbc->clearAffectedTables();
 }
 
+QueryDataTyped& SQLInternal::rowsTyped() {
+  return resultsTyped_;
+}
+
+const Status& SQLInternal::getStatus() const {
+  return status_;
+}
+
 bool SQLInternal::eventBased() const {
   return event_based_;
+}
+
+// Temporary:  I'm going to move this from sql.cpp to here in change immediately
+// following since this is the only place we actually use it (breaking up to
+// make CRs smaller)
+extern void escapeNonPrintableBytesEx(std::string& str);
+
+class StringEscaperVisitor : public boost::static_visitor<> {
+ public:
+  void operator()(long long& i) const { // NO-OP
+  }
+
+  void operator()(double& d) const { // NO-OP
+  }
+
+  void operator()(std::string& str) const {
+    escapeNonPrintableBytesEx(str);
+  }
+};
+
+void SQLInternal::escapeResults() {
+  StringEscaperVisitor visitor;
+  for (auto& rowTyped : resultsTyped_) {
+    for (auto& column : rowTyped) {
+      boost::apply_visitor(visitor, column.second);
+    }
+  }
 }
 
 Status SQLiteSQLPlugin::attach(const std::string& name) {
@@ -206,12 +250,12 @@ Status SQLiteSQLPlugin::attach(const std::string& name) {
   return attachTableInternal(name, statement, dbc, is_extension);
 }
 
-void SQLiteSQLPlugin::detach(const std::string& name) {
-  auto dbc = SQLiteDBManager::get();
-  if (!dbc->isPrimary()) {
-    return;
-  }
-  detachTableInternal(name, dbc);
+Status SQLiteSQLPlugin::detach(const std::string& name) {
+  // Detach requests occurring via the plugin/registry APIs must act on the
+  // primary database. To allow this, getConnection can explicitly request the
+  // primary instance and avoid the contention decisions.
+  auto dbc = SQLiteDBManager::getConnection(true);
+  return detachTableInternal(name, dbc);
 }
 
 SQLiteDBInstance::SQLiteDBInstance(sqlite3*& db, Mutex& mtx)
@@ -267,13 +311,14 @@ RecursiveLock SQLiteDBInstance::attachLock() const {
   return RecursiveLock(attach_mutex_);
 }
 
-void SQLiteDBInstance::addAffectedTable(VirtualTableContent* table) {
+void SQLiteDBInstance::addAffectedTable(
+    std::shared_ptr<VirtualTableContent> table) {
   // An xFilter/scan was requested for this virtual table.
-  affected_tables_.insert(std::make_pair(table->name, table));
+  affected_tables_.insert(std::make_pair(table->name, std::move(table)));
 }
 
-bool SQLiteDBInstance::tableCalled(VirtualTableContent* table) {
-  return (affected_tables_.count(table->name) > 0);
+bool SQLiteDBInstance::tableCalled(VirtualTableContent const& table) {
+  return (affected_tables_.count(table.name) > 0);
 }
 
 TableAttributes SQLiteDBInstance::getAttributes() const {
@@ -302,6 +347,7 @@ void SQLiteDBInstance::clearAffectedTables() {
     table.second->constraints.clear();
     table.second->cache.clear();
     table.second->colsUsed.clear();
+    table.second->colsUsedBitsets.clear();
   }
   // Since the affected tables are cleared, there are no more affected tables.
   // There is no concept of compounding tables between queries.
@@ -320,11 +366,43 @@ SQLiteDBInstance::~SQLiteDBInstance() {
 SQLiteDBManager::SQLiteDBManager() : db_(nullptr) {
   sqlite3_soft_heap_limit64(1);
   setDisabledTables(Flag::getValue("disable_tables"));
+  setEnabledTables(Flag::getValue("enable_tables"));
 }
 
 bool SQLiteDBManager::isDisabled(const std::string& table_name) {
-  const auto& element = instance().disabled_tables_.find(table_name);
-  return (element != instance().disabled_tables_.end());
+  bool disabled_set = !Flag::isDefault("disable_tables");
+  bool enabled_set = !Flag::isDefault("enable_tables");
+  if (!disabled_set && !enabled_set) {
+    // We have zero enabled tables and zero disabled tables.
+    // As a result, no tables are disabled.
+    return false;
+  }
+  const auto& element_disabled = instance().disabled_tables_.find(table_name);
+  const auto& element_enabled = instance().enabled_tables_.find(table_name);
+  bool table_disabled = (element_disabled != instance().disabled_tables_.end());
+  bool table_enabled = (element_enabled != instance().enabled_tables_.end());
+
+  if (table_disabled) {
+    return true;
+  }
+
+  if (table_enabled && disabled_set && !table_disabled) {
+    return false;
+  }
+
+  if (table_enabled && !disabled_set) {
+    return false;
+  }
+
+  if (enabled_set && !table_enabled) {
+    return true;
+  }
+
+  if (disabled_set && !table_disabled) {
+    return false;
+  }
+
+  return true;
 }
 
 void SQLiteDBManager::resetPrimary() {
@@ -343,6 +421,12 @@ void SQLiteDBManager::resetPrimary() {
 void SQLiteDBManager::setDisabledTables(const std::string& list) {
   const auto& tables = split(list, ",");
   disabled_tables_ =
+      std::unordered_set<std::string>(tables.begin(), tables.end());
+}
+
+void SQLiteDBManager::setEnabledTables(const std::string& list) {
+  const auto& tables = split(list, ",");
+  enabled_tables_ =
       std::unordered_set<std::string>(tables.begin(), tables.end());
 }
 
@@ -459,41 +543,117 @@ Status QueryPlanner::applyTypes(TableColumns& columns) {
   return Status(0);
 }
 
-int queryDataCallback(void* argument, int argc, char* argv[], char* column[]) {
-  if (argument == nullptr) {
-    VLOG(1) << "Query execution failed: received a bad callback argument";
-    return SQLITE_MISUSE;
-  }
-
-  auto qData = static_cast<QueryData*>(argument);
-  Row r;
-  for (int i = 0; i < argc; i++) {
-    if (column[i] != nullptr) {
-      if (r.count(column[i])) {
-        // Found a column name collision in the result.
-        VLOG(1) << "Detected overloaded column name " << column[i]
-                << " in query result consider using aliases";
-      }
-      r[column[i]] = (argv[i] != nullptr) ? argv[i] : FLAGS_nullvalue;
-    }
-  }
-  (*qData).push_back(std::move(r));
-  return 0;
-}
-
-Status queryInternal(const std::string& q,
+// Wrapper for legacy method until all uses can be replaced
+Status queryInternal(const std::string& query,
                      QueryData& results,
                      const SQLiteDBInstanceRef& instance) {
-  char* err = nullptr;
-  auto lock = instance->attachLock();
-  sqlite3_exec(instance->db(), q.c_str(), queryDataCallback, &results, &err);
-  sqlite3_db_release_memory(instance->db());
-  if (err != nullptr) {
-    auto error_string = std::string(err);
-    sqlite3_free(err);
-    return Status(1, "Error running query: " + error_string);
+  QueryDataTyped typedResults;
+  Status status = queryInternal(query, typedResults, instance);
+  if (status.ok()) {
+    results.reserve(typedResults.size());
+    for (const auto& row : typedResults) {
+      Row r;
+      for (const auto& col : row) {
+        r[col.first] = castVariant(col.second);
+      }
+      results.push_back(std::move(r));
+    }
   }
-  return Status(0, "OK");
+  return status;
+}
+
+Status readRows(sqlite3_stmt* prepared_statement,
+                QueryDataTyped& results,
+                const SQLiteDBInstanceRef& instance) {
+  // Do nothing with a null prepared_statement (eg, if the sql was just
+  // whitespace)
+  if (prepared_statement == nullptr) {
+    return Status::success();
+  }
+  int rc = sqlite3_step(prepared_statement);
+  /* if we have a result set row... */
+  if (SQLITE_ROW == rc) {
+    // First collect the column names
+    int num_columns = sqlite3_column_count(prepared_statement);
+    std::vector<std::string> colNames;
+    colNames.reserve(num_columns);
+    for (int i = 0; i < num_columns; i++) {
+      colNames.push_back(sqlite3_column_name(prepared_statement, i));
+    }
+
+    do {
+      RowTyped row;
+      for (int i = 0; i < num_columns; i++) {
+        switch (sqlite3_column_type(prepared_statement, i)) {
+        case SQLITE_INTEGER:
+          row[colNames[i]] = static_cast<long long>(
+              sqlite3_column_int64(prepared_statement, i));
+          break;
+        case SQLITE_FLOAT:
+          row[colNames[i]] = sqlite3_column_double(prepared_statement, i);
+          break;
+        case SQLITE_NULL:
+          row[colNames[i]] = FLAGS_nullvalue;
+          break;
+        default:
+          // Everything else (SQLITE_TEXT, SQLITE3_TEXT, SQLITE_BLOB) is
+          // obtained/conveyed as text/string
+          row[colNames[i]] = std::string(reinterpret_cast<const char*>(
+              sqlite3_column_text(prepared_statement, i)));
+        }
+      }
+      results.push_back(std::move(row));
+      rc = sqlite3_step(prepared_statement);
+    } while (SQLITE_ROW == rc);
+  }
+  if (rc != SQLITE_DONE) {
+    auto s = Status::failure(sqlite3_errmsg(instance->db()));
+    sqlite3_finalize(prepared_statement);
+    return s;
+  }
+
+  rc = sqlite3_finalize(prepared_statement);
+  if (rc != SQLITE_OK) {
+    return Status::failure(sqlite3_errmsg(instance->db()));
+  }
+
+  return Status::success();
+}
+
+Status queryInternal(const std::string& query,
+                     QueryDataTyped& results,
+                     const SQLiteDBInstanceRef& instance) {
+  sqlite3_stmt* prepared_statement{nullptr}; /* Statement to execute. */
+
+  int rc = SQLITE_OK; /* Return Code */
+  const char* leftover_sql = nullptr; /* Tail of unprocessed SQL */
+  const char* sql = query.c_str(); /* SQL to be processed */
+
+  /* The big while loop.  One iteration per statement */
+  while ((sql[0] != '\0') && (SQLITE_OK == rc)) {
+    const auto lock = instance->attachLock();
+
+    // Trim leading whitespace
+    while (isspace(sql[0])) {
+      sql++;
+    }
+    rc = sqlite3_prepare_v2(
+        instance->db(), sql, -1, &prepared_statement, &leftover_sql);
+    if (rc != SQLITE_OK) {
+      Status s = Status::failure(sqlite3_errmsg(instance->db()));
+      sqlite3_finalize(prepared_statement);
+      return s;
+    }
+
+    Status s = readRows(prepared_statement, results, instance);
+    if (!s.ok()) {
+      return s;
+    }
+
+    sql = leftover_sql;
+  } /* end while */
+  sqlite3_db_release_memory(instance->db());
+  return Status::success();
 }
 
 Status getQueryColumnsInternal(const std::string& q,
@@ -512,10 +672,11 @@ Status getQueryColumnsInternal(const std::string& q,
                                  &stmt,
                                  nullptr);
     if (rc != SQLITE_OK || stmt == nullptr) {
+      auto s = Status::failure(sqlite3_errmsg(instance->db()));
       if (stmt != nullptr) {
         sqlite3_finalize(stmt);
       }
-      return Status(1, sqlite3_errmsg(instance->db()));
+      return s;
     }
 
     // Get column count

@@ -1,32 +1,33 @@
 #  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
-#  This source code is licensed under both the Apache 2.0 license (found in the
-#  LICENSE file in the root directory of this source tree) and the GPLv2 (found
-#  in the COPYING file in the root directory of this source tree).
-#  You may select, at your option, one of the above-listed licenses.
-. "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)\\osquery_utils.ps1"
+#  This source code is licensed in accordance with the terms specified in
+#  the LICENSE file found in the root directory of this source tree.
 
-$serviceName = 'osqueryd'
-$serviceDescription = 'osquery daemon service'
-$progData = [System.Environment]::GetEnvironmentVariable('ProgramData')
-$targetFolder = Join-Path $progData 'osquery'
-$daemonFolder = Join-Path $targetFolder 'osqueryd'
-$extensionsFolder = Join-Path $targetFolder 'extensions'
-$logFolder = Join-Path $targetFolder 'log'
-$targetDaemonBin = Join-Path $targetFolder 'osqueryd.exe'
-$destDaemonBin = Join-Path $daemonFolder 'osqueryd.exe'
+# This library file contains constant definitions and helper functions
+
+#Requires -Version 3.0
+
+. (Join-Path "$PSScriptRoot" "osquery_utils.ps1")
+
 $packageParameters = $env:chocolateyPackageParameters
 $arguments = @{}
 
 # Ensure the service is stopped and processes are not running if exists.
-if ((Get-Service $serviceName -ErrorAction SilentlyContinue) -and `
-  (Get-Service $serviceName).Status -eq 'Running') {
+$svc = Get-WmiObject -ClassName Win32_Service -Filter "Name='osqueryd'"
+if ($svc -and $svc.State -eq 'Running') {
   Stop-Service $serviceName
   # If we find zombie processes, ensure they're termintated
   $proc = Get-Process | Where-Object { $_.ProcessName -eq 'osqueryd' }
-  if ($proc -ne $null) {
+  if ($null -ne $proc) {
     Stop-Process -Force $proc -ErrorAction SilentlyContinue
+  }
+  
+  # If the service was installed using the legacy path in ProgramData, remove
+  # it and allow the service creation below to fix it up.
+  if ([regex]::escape($svc.PathName) -like [regex]::escape("${legacyInstall}*")) {
+    Get-CimInstance -ClassName Win32_Service -Filter "Name='osqueryd'" |
+    Invoke-CimMethod -MethodName Delete
   }
 }
 
@@ -61,22 +62,53 @@ if ($packageParameters) {
   Write-Debug "No Package Parameters Passed in"
 }
 
-New-Item -Force -Type directory -Path $daemonFolder
-New-Item -Force -Type directory -Path $logFolder
-$packagePath = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)\\bin\\osquery.zip"
-Get-ChocolateyUnzip -FileFullPath $packagePath -Destination $targetFolder
+# Install the package
 
-# In order to run osqueryd as a service, we need to have a folder that has a
-# Deny Write ACL to everyone.
-Move-Item -Force -Path $targetDaemonBin -Destination $destDaemonBin
+# Create a log directory in case one doesn't already exist
+New-Item -Force -Type directory -Path $logFolder
+
+# Grab the primary folders
+$packageRoot = (Join-Path "$PSScriptRoot" "..")
+Copy-Item -Force -Recurse (Join-Path "$packageRoot" "certs") $targetFolder
+Copy-Item -Force -Recurse (Join-Path "$packageRoot" "osqueryd") $targetFolder
+Copy-Item -Force -Recurse (Join-Path "$packageRoot" "packs") $targetFolder
+
+# Grab the individual files
+Copy-Item -Force (Join-Path "$packageRoot" "manage-osqueryd.ps1") $targetFolder
+Copy-Item -Force (Join-Path "$packageRoot" "osquery.man") $targetFolder
+Copy-Item -Force (Join-Path "$PSScriptRoot" "osquery_utils.ps1") $targetFolder
+Copy-Item -Force (Join-Path "$packageRoot" "osqueryi.exe") $targetFolder
+
+# We intentionally do not replace configuration and flags files from previous
+# installations, as these often dictate the osquery configuration and may not
+# change through upgrades.
+$currConf = (Join-Path "$targetFolder" "osquery.conf")
+if (-not (Test-Path $currConf)) {
+  Copy-Item -Force (Join-Path "$packageRoot" "osquery.conf") $targetFolder
+}
+$currFlags = (Join-Path "$targetFolder" "osquery.flags")
+if (-not (Test-Path $currFlags)) {
+  Copy-Item -Force (Join-Path "$packageRoot" "osquery.flags") $targetFolder
+}
+
+# The osquery daemon requires no low privileged users have write access to run
 Set-SafePermissions $daemonFolder
 
 if ($installService) {
   if (-not (Get-Service $serviceName -ErrorAction SilentlyContinue)) {
     Write-Debug 'Installing osquery daemon service.'
     # If the 'install' parameter is passed, we create a Windows service with
-    # the flag file in the default location in \ProgramData\osquery\
-    New-Service -Name $serviceName -BinaryPathName "$destDaemonBin --flagfile=\ProgramData\osquery\osquery.flags" -DisplayName $serviceName -Description $serviceDescription -StartupType Automatic
+    # the flag file in the default location, 'C:\Program Files\osquery'
+    $cmd = '"{0}" --flagfile="{1}\osquery.flags"' -f $destDaemonBin, $targetFolder
+
+    $svcArgs = @{
+      Name = $serviceName
+      BinaryPathName = $cmd
+      DisplayName = $serviceName
+      Description = $serviceDescription
+      StartupType = "Automatic"
+    }
+    New-Service @svcArgs
 
     # If the osquery.flags file doesn't exist, we create a blank one.
     if (-not (Test-Path "$targetFolder\osquery.flags")) {
@@ -87,4 +119,4 @@ if ($installService) {
 }
 
 # Add osquery binary path to machines path for ease of use.
-Add-ToSystemPath $targetFolder
+Install-ChocolateyPath $targetFolder -PathType 'Machine'

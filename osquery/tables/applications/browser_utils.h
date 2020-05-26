@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #pragma once
@@ -18,9 +16,9 @@
 #pragma warning(pop)
 #endif
 
-#include <osquery/core/conversions.h>
-#include <osquery/filesystem.h>
+#include <osquery/filesystem/filesystem.h>
 #include <osquery/tables.h>
+#include <osquery/utils/conversions/tryto.h>
 
 namespace fs = boost::filesystem;
 
@@ -28,7 +26,10 @@ namespace osquery {
 namespace tables {
 
 QueryData genChromeBasedExtensions(QueryContext& context,
-                                   const fs::path& sub_dir);
+                                   const std::vector<fs::path>& chrome_paths);
+
+QueryData genChromeBasedExtensionContentScripts(
+    QueryContext& context, const std::vector<fs::path>& chrome_paths);
 
 /// A helper check to rename bool-type values as 1 or 0.
 inline void jsonBoolAsInt(std::string& s) {
@@ -37,5 +38,5 @@ inline void jsonBoolAsInt(std::string& s) {
     s = expected.get() ? "1" : "0";
   }
 }
-}
-}
+} // namespace tables
+} // namespace osquery

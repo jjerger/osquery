@@ -2,24 +2,23 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <boost/filesystem.hpp>
+
 #include <stdlib.h>
 #include <string>
 
-#include <osquery/filesystem.h>
+#include <osquery/filesystem/filesystem.h>
 #include <osquery/logger.h>
 #include <osquery/tables.h>
-
-#include "osquery/core/conversions.h"
+#include <osquery/utils/conversions/split.h>
+#include <osquery/utils/info/platform_type.h>
 
 #ifdef WIN32
-#include "osquery/tables/system/windows/registry.h"
+#include "windows/registry.h"
 #endif
 
 namespace fs = boost::filesystem;
@@ -30,15 +29,15 @@ namespace tables {
 /// Number of fields when splitting metadata and info.
 const size_t kNumFields = 2;
 const std::set<std::string> kPythonPath = {
-    "/usr/local/lib/python2.7/dist-packages/",
-    "/usr/local/lib/python2.7/site-packages/",
-    "/usr/lib/python2.7/dist-packages/",
-    "/usr/lib/python2.7/site-packages/",
-    "/Library/Python/2.7/site-packages/",
+    "/usr/local/lib/python%/dist-packages",
+    "/usr/local/lib/python%/site-packages",
+    "/usr/lib/python%/dist-packages",
+    "/usr/lib/python%/site-packages",
+    "/Library/Python/%/site-packages",
 };
 
 const std::set<std::string> kDarwinPythonPath = {
-    "/System/Library/Frameworks/Python.framework/Versions/",
+    "/System/Library/Frameworks/Python.framework/Versions",
 };
 
 const std::string kWinPythonInstallKey =
@@ -128,7 +127,13 @@ QueryData genPythonPackages(QueryContext& context) {
       context.constraints.at("directory").exists(EQUALS)) {
     paths = context.constraints["directory"].getAll(EQUALS);
   } else {
-    paths = kPythonPath;
+    for (const auto& path : kPythonPath) {
+      std::vector<std::string> sites;
+      resolveFilePattern(path, sites);
+      for (const auto& site : sites) {
+        paths.insert(site);
+      }
+    }
   }
   for (const auto& key : paths) {
     genSiteDirectories(key, results);
@@ -149,7 +154,7 @@ QueryData genPythonPackages(QueryContext& context) {
         }
 
         auto complete = version + "lib/python" +
-                        version_path.filename().string() + "/site-packages/";
+                        version_path.filename().string() + "/site-packages";
         genSiteDirectories(complete, results);
       }
     }

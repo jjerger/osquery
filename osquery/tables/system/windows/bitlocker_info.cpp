@@ -2,21 +2,42 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
+#include <osquery/logger.h>
 #include <osquery/sql.h>
 #include <osquery/system.h>
 #include <osquery/tables.h>
 
-#include "osquery/core/conversions.h"
 #include "osquery/core/windows/wmi.h"
+#include <osquery/utils/conversions/tryto.h>
 
 namespace osquery {
 namespace tables {
+
+static void fetchMethodResultLong(std::string& result,
+                                  const WmiRequest& req,
+                                  const WmiResultItem& object,
+                                  const std::string& method,
+                                  const std::string& param) {
+  WmiMethodArgs args;
+  WmiResultItem out;
+
+  auto status = req.ExecMethod(object, method, args, out);
+  if (status.ok()) {
+    long value = -1;
+    status = out.GetLong(param, value);
+    if (status.ok()) {
+      result = INTEGER(value);
+    } else {
+      result = INTEGER(-1);
+    }
+  } else {
+    result = INTEGER(-1);
+  }
+}
 
 QueryData genBitlockerInfo(QueryContext& context) {
   Row r;
@@ -59,6 +80,17 @@ QueryData genBitlockerInfo(QueryContext& context) {
       emethod_str = "UNKNOWN";
     }
     r["encryption_method"] = emethod_str;
+
+    fetchMethodResultLong(
+        r["version"], wmiSystemReq, data, "GetVersion", "Version");
+    fetchMethodResultLong(r["percentage_encrypted"],
+                          wmiSystemReq,
+                          data,
+                          "GetConversionStatus",
+                          "EncryptionPercentage");
+    fetchMethodResultLong(
+        r["lock_status"], wmiSystemReq, data, "GetLockStatus", "LockStatus");
+
     results.push_back(r);
   }
 

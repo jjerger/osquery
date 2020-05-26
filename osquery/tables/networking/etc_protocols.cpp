@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <string>
@@ -16,12 +14,11 @@
 #include <boost/filesystem/path.hpp>
 
 #include <osquery/core.h>
-#include <osquery/filesystem.h>
+#include <osquery/filesystem/filesystem.h>
 #include <osquery/logger.h>
 #include <osquery/tables.h>
-
-#include "osquery/core/conversions.h"
-#include "osquery/filesystem/fileops.h"
+#include <osquery/filesystem/fileops.h>
+#include <osquery/utils/conversions/split.h>
 
 namespace fs = boost::filesystem;
 
@@ -58,10 +55,10 @@ QueryData parseEtcProtocolsContent(const std::string& content) {
     }
 
     Row r;
-    r["name"] = TEXT(protocol_fields[0]);
+    r["name"] = SQL_TEXT(protocol_fields[0]);
     r["number"] = INTEGER(protocol_fields[1]);
     if (protocol_fields.size() > 2) {
-      r["alias"] = TEXT(protocol_fields[2]);
+      r["alias"] = SQL_TEXT(protocol_fields[2]);
     }
 
     // If there is a comment for the service.
@@ -69,7 +66,7 @@ QueryData parseEtcProtocolsContent(const std::string& content) {
       // Removes everything except the comment (parts of the comment).
       protocol_comment.erase(protocol_comment.begin(),
                              protocol_comment.begin() + 1);
-      r["comment"] = TEXT(boost::algorithm::join(protocol_comment, " # "));
+      r["comment"] = SQL_TEXT(boost::algorithm::join(protocol_comment, " # "));
     }
     results.push_back(r);
   }

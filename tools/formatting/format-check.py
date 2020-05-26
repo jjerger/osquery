@@ -1,12 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 #  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
-#  This source code is licensed under both the Apache 2.0 license (found in the
-#  LICENSE file in the root directory of this source tree) and the GPLv2 (found
-#  in the COPYING file in the root directory of this source tree).
-#  You may select, at your option, one of the above-listed licenses.
+#  This source code is licensed in accordance with the terms specified in
+#  the LICENSE file found in the root directory of this source tree.
 
 import argparse
 import os
@@ -14,19 +12,24 @@ import subprocess
 import sys
 
 
-def check(base_commit):
+def check(base_commit, exclude_folders):
     try:
-        p = subprocess.Popen(
-                [
-                    "python",
-                    os.path.join("tools", "formatting", "git-clang-format.py"),
-                    "--style=file",
-                    "--diff",
-                    "--commit",
-                    base_commit,
-                    ],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                )
+        cmd = [
+          sys.executable,
+          os.path.join(os.path.dirname(os.path.abspath(__file__)), "git-clang-format.py"),
+          "--style=file",
+          "--diff",
+          "--commit",
+          base_commit,
+        ]
+
+        if exclude_folders:
+            cmd += ["--exclude-folders", exclude_folders]
+
+        p = subprocess.Popen(cmd,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE,
+                             encoding='utf8')
         out, err = p.communicate()
     except OSError as e:
         print("{}\n\n{!r}".format("Failed to call git-clang-format.py", e))
@@ -53,7 +56,7 @@ def get_base_commit(base_branch):
     try:
         return subprocess.check_output(
                 ["git", "merge-base", "HEAD", base_branch]
-                ).strip()
+                ).decode().strip()
     except OSError as e:
         print("{}\n\n{}".format("Failed to execut git", str(e)))
     except subprocess.CalledProcessError as e:
@@ -64,6 +67,13 @@ def get_base_commit(base_branch):
 
 def main():
     parser = argparse.ArgumentParser(description="Check code changes formatting.")
+    parser.add_argument(
+            "--exclude-folders",
+            metavar="excluded_folders",
+            type=str,
+            default="",
+            help="comma-separated list of relative paths to folders to exclude from formatting"
+    )
     parser.add_argument(
             "base_branch",
             metavar="base_branch",
@@ -77,7 +87,7 @@ def main():
 
     base_commit = get_base_commit(args.base_branch)
 
-    return check(base_commit) if base_commit is not None else False
+    return check(base_commit, args.exclude_folders) if base_commit is not None else False
 
 if __name__ == "__main__":
     sys.exit(not main())

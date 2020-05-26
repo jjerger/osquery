@@ -2,10 +2,8 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <chrono>
@@ -21,16 +19,18 @@
 #include <boost/filesystem.hpp>
 #include <boost/thread.hpp>
 
-#include <osquery/config.h>
-#include <osquery/filesystem.h>
+#include <osquery/config/config.h>
+#include <osquery/core/sql/query_data.h>
+#include <osquery/core/watcher.h>
+#include <osquery/data_logger.h>
+#include <osquery/filesystem/fileops.h>
+#include <osquery/filesystem/filesystem.h>
 #include <osquery/logger.h>
+#include <osquery/process/process.h>
 #include <osquery/sql.h>
-#include <osquery/system.h>
-
-#include "osquery/core/conversions.h"
-#include "osquery/core/process.h"
-#include "osquery/core/watcher.h"
-#include "osquery/filesystem/fileops.h"
+#include <osquery/utils/conversions/tryto.h>
+#include <osquery/utils/info/tool_type.h>
+#include <osquery/utils/system/time.h>
 
 namespace fs = boost::filesystem;
 
@@ -215,7 +215,8 @@ void WatcherRunner::start() {
 
       auto status = watcher.getWorkerStatus();
       if (status == EXIT_CATASTROPHIC) {
-        Initializer::requestShutdown(EXIT_CATASTROPHIC);
+        Initializer::requestShutdown(EXIT_CATASTROPHIC,
+                                     "Worker returned exit status");
         break;
       }
 
@@ -543,8 +544,9 @@ void WatcherRunner::createWorker() {
                             EQUALS,
                             INTEGER(PlatformProcess::getCurrentPid()));
   if (qd.size() != 1 || qd[0].count("path") == 0 || qd[0]["path"].size() == 0) {
-    LOG(ERROR) << "osquery watcher cannot determine process path for worker";
-    Initializer::requestShutdown(EXIT_FAILURE);
+    Initializer::requestShutdown(
+        EXIT_FAILURE,
+        "osquery watcher cannot determine process path for worker");
     return;
   }
 
@@ -564,9 +566,9 @@ void WatcherRunner::createWorker() {
   if (!safePermissions(
           exec_path.parent_path().string(), exec_path.string(), true)) {
     // osqueryd binary has become unsafe.
-    LOG(ERROR) << RLOG(1382)
-               << "osqueryd has unsafe permissions: " << exec_path.string();
-    Initializer::requestShutdown(EXIT_FAILURE);
+    auto message = std::string(RLOG(1382)) +
+                   "osqueryd has unsafe permissions: " + exec_path.string();
+    Initializer::requestShutdown(EXIT_FAILURE, message);
     return;
   }
 
@@ -574,7 +576,7 @@ void WatcherRunner::createWorker() {
   if (worker == nullptr) {
     // Unrecoverable error, cannot create a worker process.
     LOG(ERROR) << "osqueryd could not create a worker process";
-    Initializer::shutdown(EXIT_FAILURE);
+    Initializer::shutdownNow(EXIT_FAILURE);
     return;
   }
 
@@ -621,7 +623,7 @@ void WatcherRunner::createExtension(const std::string& extension) {
   if (ext_process == nullptr) {
     // Unrecoverable error, cannot create an extension process.
     LOG(ERROR) << "Cannot create extension process: " << extension;
-    Initializer::shutdown(EXIT_FAILURE);
+    Initializer::shutdownNow(EXIT_FAILURE);
   }
 
   watcher.setExtension(extension, ext_process);

@@ -2,11 +2,15 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
+
+#include <osquery/filesystem/fileops.h>
+#include <osquery/logger.h>
+#include <osquery/process/process.h>
+#include <osquery/process/windows/process_ops.h>
+#include <osquery/utils/conversions/windows/strings.h>
 
 #include <AclAPI.h>
 #include <LM.h>
@@ -18,16 +22,11 @@
 
 #include <memory>
 #include <regex>
+#include <set>
 #include <vector>
 
 #include <boost/filesystem.hpp>
 #include <boost/optional.hpp>
-
-#include <osquery/logger.h>
-
-#include "osquery/core/process.h"
-#include "osquery/core/windows/process_ops.h"
-#include "osquery/filesystem/fileops.h"
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #define max(a, b) (((a) > (b)) ? (a) : (b))
@@ -37,8 +36,8 @@ namespace errc = boost::system::errc;
 
 namespace osquery {
 
-int getUidFromSid(PSID sid);
-int getGidFromSid(PSID sid);
+uint32_t getUidFromSid(PSID sid);
+uint32_t getGidFromSid(PSID sid);
 
 /*
  * Avoid having the same right being used in multiple CHMOD_* macros. Doing so
@@ -55,7 +54,7 @@ using AclObject = std::unique_ptr<unsigned char[]>;
 class WindowsFindFiles {
  public:
   explicit WindowsFindFiles(const fs::path& path) : path_(path) {
-    handle_ = ::FindFirstFileA(path_.make_preferred().string().c_str(), &fd_);
+    handle_ = ::FindFirstFileW(path_.make_preferred().wstring().c_str(), &fd_);
   }
 
   ~WindowsFindFiles() {
@@ -70,8 +69,8 @@ class WindowsFindFiles {
 
     if (handle_ != INVALID_HANDLE_VALUE) {
       do {
-        std::string component(fd_.cFileName);
-        if (component != "." && component != "..") {
+        const std::wstring component = fd_.cFileName;
+        if (component != L"." && component != L"..") {
           if (path_.has_parent_path()) {
             results.push_back(path_.parent_path() / component);
           } else {
@@ -80,7 +79,7 @@ class WindowsFindFiles {
         }
 
         ::RtlZeroMemory(&fd_, sizeof(fd_));
-      } while (::FindNextFileA(handle_, &fd_));
+      } while (::FindNextFileW(handle_, &fd_));
     }
 
     return results;
@@ -101,30 +100,33 @@ class WindowsFindFiles {
 
  private:
   HANDLE handle_{INVALID_HANDLE_VALUE};
-  WIN32_FIND_DATAA fd_{0};
+  WIN32_FIND_DATAW fd_{0};
 
   fs::path path_;
 };
 
 Status windowsShortPathToLongPath(const std::string& shortPath,
                                   std::string& rLongPath) {
-  TCHAR longPath[MAX_PATH];
-  auto ret = GetLongPathName(shortPath.c_str(), longPath, MAX_PATH);
+  WCHAR longPath[MAX_PATH];
+  auto ret =
+      GetLongPathNameW(stringToWstring(shortPath).c_str(), longPath, MAX_PATH);
   if (ret == 0) {
     return Status(GetLastError(), "Failed to convert short path to long path");
   }
-  rLongPath = std::string(longPath);
-  return Status();
+  rLongPath = wstringToString(longPath);
+  return Status::success();
 }
 
 Status windowsGetFileVersion(const std::string& path, std::string& rVersion) {
   DWORD handle = 0;
-  auto verSize = GetFileVersionInfoSize(path.c_str(), &handle);
+  std::wstring wpath = stringToWstring(path).c_str();
+  auto verSize = GetFileVersionInfoSizeW(wpath.c_str(), &handle);
   auto verInfo = std::make_unique<BYTE[]>(verSize);
   if (verInfo == nullptr) {
     return Status(1, "Failed to malloc for version info");
   }
-  auto err = GetFileVersionInfo(path.c_str(), handle, verSize, verInfo.get());
+  auto err = GetFileVersionInfoW(
+      stringToWstring(path).c_str(), handle, verSize, verInfo.get());
   if (err == 0) {
     return Status(GetLastError(), "Failed to get file version info");
   }
@@ -140,10 +142,10 @@ Status windowsGetFileVersion(const std::string& path, std::string& rVersion) {
       std::to_string((pFileInfo->dwProductVersionMS >> 0 & 0xffff)) + "." +
       std::to_string((pFileInfo->dwProductVersionLS >> 16 & 0xffff)) + "." +
       std::to_string((pFileInfo->dwProductVersionLS >> 0 & 0xffff));
-  return Status();
+  return Status::success();
 }
 
-static bool hasGlobBraces(const std::string& glob) {
+static bool hasGlobBraces(const std::wstring& glob) {
   int brace_depth = 0;
   bool has_brace = false;
 
@@ -164,7 +166,7 @@ static bool hasGlobBraces(const std::string& glob) {
 }
 
 AsyncEvent::AsyncEvent() {
-  overlapped_.hEvent = ::CreateEventA(nullptr, FALSE, FALSE, nullptr);
+  overlapped_.hEvent = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
 
 AsyncEvent::~AsyncEvent() {
@@ -174,50 +176,50 @@ AsyncEvent::~AsyncEvent() {
 }
 
 // Inspired by glob-to-regexp node package
-static std::string globToRegex(const std::string& glob) {
+static std::wstring globToRegex(const std::wstring& glob) {
   bool in_group = false;
-  std::string regex("^");
+  std::wstring regex(L"^");
 
   for (size_t i = 0; i < glob.size(); i++) {
     char c = glob[i];
 
     switch (c) {
-    case '?':
-      regex += '.';
+    case L'?':
+      regex += L'.';
       break;
-    case '{':
+    case L'{':
       in_group = true;
-      regex += '(';
+      regex += L'(';
       break;
-    case '}':
+    case L'}':
       in_group = false;
-      regex += ')';
+      regex += L')';
       break;
-    case ',':
-      regex += '|';
+    case L',':
+      regex += L'|';
       break;
-    case '*':
-      regex += ".*";
+    case L'*':
+      regex += L".*";
       break;
-    case '\\':
-    case '/':
-    case '$':
-    case '^':
-    case '+':
-    case '.':
-    case '(':
-    case ')':
-    case '=':
-    case '!':
-    case '|':
-      regex += '\\';
+    case L'\\':
+    case L'/':
+    case L'$':
+    case L'^':
+    case L'+':
+    case L'.':
+    case L'(':
+    case L')':
+    case L'=':
+    case L'!':
+    case L'|':
+      regex += L'\\';
     default:
       regex += c;
       break;
     }
   }
 
-  return regex + "$";
+  return regex + L"$";
 }
 
 static DWORD getNewAclSize(PACL dacl,
@@ -229,7 +231,7 @@ static DWORD getNewAclSize(PACL dacl,
   DWORD acl_size = info.AclBytesInUse;
 
   /*
-   * By default, we assume that the ACL as pointed to by the dacl arugment does
+   * By default, we assume that the ACL as pointed to by the dacl argument does
    * not contain any access control entries (further known as ACE) associated
    * with sid. If we require an access allowed and/or access denied ACE, we will
    * increment acl_size by the size of the new ACE.
@@ -342,7 +344,7 @@ static Status checkAccessWithSD(PSECURITY_DESCRIPTOR sd, mode_t mode) {
   }
 
   if (access_status) {
-    return Status();
+    return Status::success();
   }
 
   return Status(1, "Bad mode for file");
@@ -595,7 +597,7 @@ PlatformFile::PlatformFile(const fs::path& path, int mode, int perms)
     // TODO(#2001): set up a security descriptor based off the perms
   }
 
-  handle_ = ::CreateFileA(fname_.string().c_str(),
+  handle_ = ::CreateFileW(fname_.wstring().c_str(),
                           access_mask,
                           FILE_SHARE_READ,
                           security_attrs.get(),
@@ -627,41 +629,51 @@ bool PlatformFile::isSpecialFile() const {
   return (GetFileType(handle_) != FILE_TYPE_DISK);
 }
 
-static Status isUserCurrentUser(PSID user) {
-  if (!IsValidSid(user)) {
-    return Status(-1, "Invalid SID");
-  }
-
+std::unique_ptr<BYTE[]> getCurrentUserInfo() {
   HANDLE token = INVALID_HANDLE_VALUE;
   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_READ, &token)) {
-    return Status(-1, "OpenProcessToken failed");
+    VLOG(1) << "OpenProcessToken failed";
+    return nullptr;
   }
 
   unsigned long size = 0;
   auto ret = GetTokenInformation(token, TokenUser, nullptr, 0, &size);
   if (ret || (!ret && GetLastError() != ERROR_INSUFFICIENT_BUFFER)) {
     CloseHandle(token);
-
-    return Status(
-        -1,
-        "GetTokenInformation failed (" + std::to_string(GetLastError()) + ")");
+    VLOG(1) << "GetTokenInformation failed (" << GetLastError() << ")";
+    return nullptr;
   }
 
-  /// Obtain the user SID behind the token handle
-  std::vector<char> tuBuff(size, '\0');
-  ret = GetTokenInformation(token, TokenUser, tuBuff.data(), size, &size);
+  /// Obtain the TOKEN_USER behind the token handle
+  auto ptoken_user = std::make_unique<BYTE[]>(size);
+
+  ret = GetTokenInformation(token, TokenUser, ptoken_user.get(), size, &size);
   CloseHandle(token);
 
   if (!ret) {
-    return Status(
-        -1,
-        "GetTokenInformation failed (" + std::to_string(GetLastError()) + ")");
+    VLOG(1) << "GetTokenInformation failed (" << GetLastError() << ")";
+    return nullptr;
+  }
+
+  return ptoken_user;
+}
+
+static Status isUserCurrentUser(PSID user) {
+  if (!IsValidSid(user)) {
+    return Status(-1, "Invalid SID");
+  }
+
+  auto ptuSmartPtr = getCurrentUserInfo();
+
+  if (!ptuSmartPtr) {
+    return Status::failure(-1, "Accessing current user info failed");
   }
 
   /// Determine if the current user SID matches that of the specified user
-  PTOKEN_USER ptu = reinterpret_cast<PTOKEN_USER>(tuBuff.data());
+  PTOKEN_USER ptu = reinterpret_cast<PTOKEN_USER>(ptuSmartPtr.get());
+
   if (EqualSid(user, ptu->User.Sid)) {
-    return Status();
+    return Status::success();
   }
 
   return Status(1, "User not current user");
@@ -703,7 +715,7 @@ Status PlatformFile::isOwnerRoot() const {
   }
 
   if (EqualSid(owner, admins_sid) || EqualSid(owner, system_sid)) {
-    return Status();
+    return Status::success();
   }
 
   return Status(1, "Owner is not in Administrators group or Local System");
@@ -771,7 +783,7 @@ static Status lowPrivWriteDenied(PACL acl) {
   for (unsigned long i = 0; i < acl->AceCount; i++) {
     if (!GetAce(acl, i, &void_ent)) {
       return Status(-1,
-                    "Failed to retreive ACE when checking safe permissions");
+                    "Failed to retrieve ACE when checking safe permissions");
     }
     auto entry = static_cast<PACE_HEADER>(void_ent);
 
@@ -788,7 +800,7 @@ static Status lowPrivWriteDenied(PACL acl) {
 
       // A Deny-Write on Everyone supersedes other allow writes
       if (EqualSid(&denied_ace->SidStart, world_sid)) {
-        return Status();
+        return Status::success();
       }
 
       // Stash the Deny-Write ACE to check against future user Allow ACEs
@@ -829,7 +841,7 @@ static Status lowPrivWriteDenied(PACL acl) {
       }
     }
   }
-  return Status();
+  return Status::success();
 }
 
 Status PlatformFile::hasSafePermissions() const {
@@ -849,19 +861,19 @@ Status PlatformFile::hasSafePermissions() const {
   SecurityDescriptor file_sd_wrapper(file_sd);
 
   // Get the access control list for the parent directory
-  std::vector<char> path_buf(MAX_PATH + 1, '\0');
-  if (GetFinalPathNameByHandleA(
+  std::vector<WCHAR> path_buf(MAX_PATH + 1, '\0');
+  if (GetFinalPathNameByHandleW(
           handle_, path_buf.data(), MAX_PATH, FILE_NAME_NORMALIZED) == 0) {
-    return Status(-1, "GetFinalPathNameByHandleA failed");
+    return Status(-1, "GetFinalPathNameByHandle failed");
   }
 
-  if (!PathRemoveFileSpecA(path_buf.data())) {
+  if (!PathRemoveFileSpecW(path_buf.data())) {
     return Status(-1, "PathRemoveFileSpec");
   }
 
   PACL dir_dacl = nullptr;
   PSECURITY_DESCRIPTOR dir_sd = nullptr;
-  if (GetNamedSecurityInfoA(path_buf.data(),
+  if (GetNamedSecurityInfoW(path_buf.data(),
                             SE_FILE_OBJECT,
                             DACL_SECURITY_INFORMATION,
                             nullptr,
@@ -885,7 +897,7 @@ Status PlatformFile::hasSafePermissions() const {
   if (!s.ok()) {
     return Status(1, "Write ACE was found on the parent directory");
   }
-  return Status(0, "OK");
+  return Status::success();
 }
 
 bool PlatformFile::getFileTimes(PlatformTime& times) {
@@ -1103,18 +1115,18 @@ bool platformSetSafeDbPerms(const std::string& path) {
     return false;
   }
 
-  EXPLICIT_ACCESS admins_ea;
+  EXPLICIT_ACCESSW admins_ea;
   admins_ea.grfAccessMode = SET_ACCESS;
   admins_ea.grfAccessPermissions = GENERIC_ALL;
   admins_ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
 
-  PTRUSTEE_A trust = static_cast<PTRUSTEE_A>(malloc(sizeof(TRUSTEE_A)));
-  BuildTrusteeWithSidA(trust, admins);
+  PTRUSTEE_W trust = static_cast<PTRUSTEE_W>(malloc(sizeof(TRUSTEE_W)));
+  BuildTrusteeWithSidW(trust, admins);
   admins_ea.Trustee = *trust;
 
   // Set the Administrators ACE
   PACL new_dacl = nullptr;
-  auto ret = SetEntriesInAcl(1, &admins_ea, nullptr, &new_dacl);
+  auto ret = SetEntriesInAclW(1, &admins_ea, nullptr, &new_dacl);
   if (ret != ERROR_SUCCESS) {
     VLOG(1) << "Failed to set DB permissions for Administrators";
     LocalFree(new_dacl);
@@ -1123,14 +1135,14 @@ bool platformSetSafeDbPerms(const std::string& path) {
   }
 
   // Set the SYSTEM ACE
-  EXPLICIT_ACCESS sys_ea;
+  EXPLICIT_ACCESSW sys_ea;
   sys_ea.grfAccessMode = SET_ACCESS;
   sys_ea.grfAccessPermissions = GENERIC_ALL;
   sys_ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
 
-  BuildTrusteeWithSidA(trust, system);
+  BuildTrusteeWithSidW(trust, system);
   sys_ea.Trustee = *trust;
-  ret = SetEntriesInAcl(1, &sys_ea, new_dacl, &new_dacl);
+  ret = SetEntriesInAclW(1, &sys_ea, new_dacl, &new_dacl);
   if (ret != ERROR_SUCCESS) {
     VLOG(1) << "Failed to set DB permissions for SYSTEM";
     LocalFree(new_dacl);
@@ -1139,14 +1151,14 @@ bool platformSetSafeDbPerms(const std::string& path) {
   }
 
   // Grant Everyone the ability to read the DACL
-  EXPLICIT_ACCESS world_ea;
+  EXPLICIT_ACCESSW world_ea;
   world_ea.grfAccessMode = SET_ACCESS;
   world_ea.grfAccessPermissions = READ_CONTROL;
   world_ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
 
-  BuildTrusteeWithSidA(trust, world);
+  BuildTrusteeWithSidW(trust, world);
   world_ea.Trustee = *trust;
-  ret = SetEntriesInAcl(1, &world_ea, new_dacl, &new_dacl);
+  ret = SetEntriesInAclW(1, &world_ea, new_dacl, &new_dacl);
   if (ret != ERROR_SUCCESS) {
     VLOG(1) << "Failed to set DB permissions for SYSTEM";
     LocalFree(new_dacl);
@@ -1154,9 +1166,10 @@ bool platformSetSafeDbPerms(const std::string& path) {
     return false;
   }
 
+  std::wstring wide_path = stringToWstring(path.c_str());
   // Apply 'safe' DACL and avoid returning to attempt applying the DACL
-  ret = SetNamedSecurityInfoA(
-      const_cast<char*>(path.c_str()),
+  ret = SetNamedSecurityInfoW(
+      const_cast<PWSTR>(wide_path.c_str()),
       SE_FILE_OBJECT,
       OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
           DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
@@ -1177,7 +1190,7 @@ bool platformChmod(const std::string& path, mode_t perms) {
   PSID owner = nullptr;
   PSECURITY_DESCRIPTOR sd = nullptr;
 
-  auto ret = GetNamedSecurityInfoA(path.c_str(),
+  auto ret = GetNamedSecurityInfoW(stringToWstring(path).c_str(),
                                    SE_FILE_OBJECT,
                                    OWNER_SECURITY_INFORMATION |
                                        GROUP_SECURITY_INFORMATION |
@@ -1268,8 +1281,9 @@ bool platformChmod(const std::string& path, mode_t perms) {
     return false;
   }
 
+  std::wstring wide_path = stringToWstring(path);
   // Lastly, apply the permissions to the object
-  if (SetNamedSecurityInfoA(const_cast<char*>(path.c_str()),
+  if (SetNamedSecurityInfoW(const_cast<LPWSTR>(wide_path.c_str()),
                             SE_FILE_OBJECT,
                             DACL_SECURITY_INFORMATION,
                             nullptr,
@@ -1282,7 +1296,7 @@ bool platformChmod(const std::string& path, mode_t perms) {
 }
 
 std::vector<std::string> platformGlob(const std::string& find_path) {
-  fs::path full_path(find_path);
+  fs::path full_path(stringToWstring(find_path));
 
   /*
    * This is a naive implementation of GLOB_TILDE. If the first two characters
@@ -1293,15 +1307,16 @@ std::vector<std::string> platformGlob(const std::string& find_path) {
       (find_path[1] == '/' || find_path[1] == '\\')) {
     auto homedir = getEnvVar("USERPROFILE");
     if (homedir.is_initialized()) {
-      full_path = fs::path(*homedir) / find_path.substr(2);
+      full_path = fs::path(stringToWstring(*homedir)) /
+                  stringToWstring(find_path.substr(2));
     }
   }
 
-  std::regex pattern(".*[*\?].*");
+  std::wregex pattern(L".*[*\?].*");
 
   // This vector will contain all the valid paths at each stage of the
   std::vector<fs::path> valid_paths;
-  valid_paths.push_back(fs::path(""));
+  valid_paths.push_back(fs::path(L""));
 
   if (full_path.has_parent_path()) {
     /*
@@ -1317,25 +1332,25 @@ std::vector<std::string> platformGlob(const std::string& find_path) {
        * for directories matching the specified glob pattern.
        */
       for (auto const& valid_path : valid_paths) {
-        if (hasGlobBraces(component.string())) {
+        if (hasGlobBraces(component.wstring())) {
           /*
            * If the component contains braces, we convert the component into a
            * regex, enumerate through all the directories in the current
            * directory and only mark the ones fitting the regex pattern as
            * valid.
            */
-          std::regex component_pattern(globToRegex(component.string()));
-          WindowsFindFiles wf(valid_path / "*");
+          std::wregex component_pattern(globToRegex(component.wstring()));
+          WindowsFindFiles wf(valid_path / L"*");
           for (auto const& file_path : wf.getDirectories()) {
-            if (std::regex_match(file_path.filename().string(),
+            if (std::regex_match(file_path.filename().wstring(),
                                  component_pattern)) {
               tmp_valid_paths.push_back(file_path);
             }
           }
-        } else if (std::regex_match(component.string(), pattern)) {
+        } else if (std::regex_match(component.wstring(), pattern)) {
           /*
            * If the component contains wildcard characters such as * or ?, we
-           * pass the pattern into the Windows FindFirstFileA function to get a
+           * pass the pattern into the Windows FindFirstFileW function to get a
            * list of valid directories.
            */
           WindowsFindFiles wf(valid_path / component);
@@ -1351,8 +1366,9 @@ std::vector<std::string> platformGlob(const std::string& find_path) {
           boost::system::error_code ec;
           if (fs::exists(valid_path / component, ec) &&
               ec.value() == errc::success) {
-            fs::path tmp_vpath =
-                component.string() != "." ? valid_path / component : valid_path;
+            fs::path tmp_vpath = component.wstring() != L"."
+                                     ? valid_path / component
+                                     : valid_path;
             tmp_valid_paths.push_back(tmp_vpath);
           }
         }
@@ -1370,34 +1386,35 @@ std::vector<std::string> platformGlob(const std::string& find_path) {
    * valid paths are return the list.
    */
   for (auto const& valid_path : valid_paths) {
-    if (hasGlobBraces(full_path.filename().string())) {
-      std::regex component_pattern(globToRegex(full_path.filename().string()));
-      WindowsFindFiles wf(valid_path / "*");
+    if (hasGlobBraces(full_path.filename().wstring())) {
+      std::wregex component_pattern(
+          globToRegex(full_path.filename().wstring()));
+      WindowsFindFiles wf(valid_path / L"*");
       for (auto& result : wf.get()) {
-        if (std::regex_match(result.filename().string(), component_pattern)) {
-          auto result_path = result.make_preferred().string();
+        if (std::regex_match(result.filename().wstring(), component_pattern)) {
+          auto result_path = result.make_preferred().wstring();
 
           boost::system::error_code ec;
           if (fs::is_directory(result, ec) && ec.value() == errc::success) {
-            result_path += "\\";
+            result_path += L"\\";
           }
-          results.push_back(result_path);
+          results.push_back(wstringToString(result_path));
         }
       }
     } else {
-      fs::path glob_path = full_path.filename() == "."
+      fs::path glob_path = full_path.filename() == L"."
                                ? valid_path
                                : valid_path / full_path.filename();
 
       WindowsFindFiles wf(glob_path);
       for (auto& result : wf.get()) {
-        auto result_path = result.make_preferred().string();
+        auto result_path = result.make_preferred().wstring();
 
         boost::system::error_code ec;
         if (fs::is_directory(result, ec) && ec.value() == errc::success) {
-          result_path += "\\";
+          result_path += L"\\";
         }
-        results.push_back(result_path);
+        results.push_back(wstringToString(result_path));
       }
     }
   }
@@ -1406,13 +1423,13 @@ std::vector<std::string> platformGlob(const std::string& find_path) {
 }
 
 boost::optional<std::string> getHomeDirectory() {
-  std::vector<char> profile(MAX_PATH);
+  std::vector<WCHAR> profile(MAX_PATH);
   auto value = getEnvVar("USERPROFILE");
   if (value.is_initialized()) {
     return value;
-  } else if (SUCCEEDED(::SHGetFolderPathA(
+  } else if (SUCCEEDED(::SHGetFolderPathW(
                  nullptr, CSIDL_PROFILE, nullptr, 0, profile.data()))) {
-    return std::string(profile.data());
+    return wstringToString(profile.data());
   } else {
     return boost::none;
   }
@@ -1429,28 +1446,28 @@ int platformAccess(const std::string& path, mode_t mode) {
 }
 
 static std::string normalizeDirPath(const fs::path& path) {
-  std::regex pattern(".*[*?\"|<>].*");
+  std::wregex pattern(L".*[*?\"|<>].*");
 
-  std::vector<char> full_path(MAX_PATH + 1);
-  std::vector<char> final_path(MAX_PATH + 1);
+  std::vector<WCHAR> full_path(MAX_PATH + 1);
+  std::vector<WCHAR> final_path(MAX_PATH + 1);
 
-  full_path.assign(MAX_PATH + 1, '\0');
-  final_path.assign(MAX_PATH + 1, '\0');
+  full_path.assign(MAX_PATH + 1, L'\0');
+  final_path.assign(MAX_PATH + 1, L'\0');
 
   // Fail if illegal characters are detected in the path
-  if (std::regex_match(path.string(), pattern)) {
+  if (std::regex_match(path.wstring(), pattern)) {
     return std::string();
   }
 
   // Obtain the full path of the fs::path object
-  DWORD nret = ::GetFullPathNameA(
-      path.string().c_str(), MAX_PATH, full_path.data(), nullptr);
+  DWORD nret = ::GetFullPathNameW(
+      path.wstring().c_str(), MAX_PATH, full_path.data(), nullptr);
   if (nret == 0) {
     return std::string();
   }
 
   HANDLE handle = INVALID_HANDLE_VALUE;
-  handle = ::CreateFileA(full_path.data(),
+  handle = ::CreateFileW(full_path.data(),
                          GENERIC_READ,
                          FILE_SHARE_READ,
                          nullptr,
@@ -1462,7 +1479,7 @@ static std::string normalizeDirPath(const fs::path& path) {
   }
 
   // Resolve any symbolic links (somewhat rare on Windows)
-  nret = ::GetFinalPathNameByHandleA(
+  nret = ::GetFinalPathNameByHandleW(
       handle, final_path.data(), MAX_PATH, FILE_NAME_NORMALIZED);
   ::CloseHandle(handle);
 
@@ -1471,10 +1488,10 @@ static std::string normalizeDirPath(const fs::path& path) {
   }
 
   // NTFS is case insensitive, to normalize, make everything uppercase
-  ::CharUpperA(final_path.data());
+  ::CharUpperW(final_path.data());
 
   boost::system::error_code ec;
-  std::string normalized_path(final_path.data(), nret);
+  std::string normalized_path = wstringToString(final_path.data());
   if ((fs::is_directory(normalized_path, ec) && ec.value() == errc::success) &&
       normalized_path[nret - 1] != '\\') {
     normalized_path += "\\";
@@ -1495,13 +1512,13 @@ Status platformIsTmpDir(const fs::path& dir) {
   if (!dirPathsAreEqual(dir, fs::temp_directory_path(ec))) {
     return Status(1, "Not temp directory");
   }
-  return Status();
+  return Status::success();
 }
 
 Status platformIsFileAccessible(const fs::path& path) {
   boost::system::error_code ec;
   if (fs::is_regular_file(path, ec) && ec.value() == errc::success) {
-    return Status();
+    return Status::success();
   }
   return Status(1, "Not accessible file");
 }
@@ -1537,7 +1554,7 @@ boost::optional<FILE*> platformFopen(const std::string& filename,
  */
 Status socketExists(const fs::path& path, bool remove_socket) {
   DWORD timeout = (remove_socket) ? 0 : 500;
-  if (::WaitNamedPipeA(path.string().c_str(), timeout) == 0) {
+  if (::WaitNamedPipeW(path.wstring().c_str(), timeout) == 0) {
     DWORD error = ::GetLastError();
     if (error == ERROR_BAD_PATHNAME) {
       return Status(1, "Named pipe path is invalid");
@@ -1549,7 +1566,7 @@ Status socketExists(const fs::path& path, bool remove_socket) {
       return Status(1, "Named pipe does not exist");
     }
   }
-  return Status(0, "OK");
+  return Status::success();
 }
 
 LONGLONG filetimeToUnixtime(const FILETIME& ft) {
@@ -1628,19 +1645,19 @@ std::string getFileAttribStr(unsigned long file_attributes) {
 }
 
 std::string lastErrorMessage(unsigned long error_code) {
-  LPTSTR msg_buffer = nullptr;
+  LPWSTR msg_buffer = nullptr;
 
-  FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-                    FORMAT_MESSAGE_IGNORE_INSERTS,
-                NULL,
-                error_code,
-                MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                (LPTSTR)&msg_buffer,
-                0,
-                NULL);
+  FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                     FORMAT_MESSAGE_IGNORE_INSERTS,
+                 NULL,
+                 error_code,
+                 MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                 (LPWSTR)&msg_buffer,
+                 0,
+                 NULL);
 
   if (msg_buffer != NULL) {
-    auto error_message = std::string(msg_buffer);
+    auto error_message = wstringToString(msg_buffer);
     LocalFree(msg_buffer);
     msg_buffer = nullptr;
 
@@ -1658,19 +1675,22 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
                               FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_OFFLINE |
                               FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM |
                               FILE_ATTRIBUTE_TEMPORARY;
-  boost::system::error_code ec;
-  if (fs::is_directory(path, ec) && ec.value() == errc::success) {
+  // NOTE: cannot call path.wstring(), in the event path was constructed from an
+  // std::string, in which case, internal fs::path conversion to wstring will be
+  // performed incorrectly.
+
+  if (PathIsDirectoryW(stringToWstring(path.string()).c_str())) {
     FLAGS_AND_ATTRIBUTES |= FILE_FLAG_BACKUP_SEMANTICS;
   }
 
   // Get the handle of the file object.
-  auto file_handle = CreateFile(path.string().c_str(),
-                                GENERIC_READ,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                nullptr,
-                                OPEN_EXISTING,
-                                FLAGS_AND_ATTRIBUTES,
-                                nullptr);
+  auto file_handle = CreateFileW(stringToWstring(path.string()).c_str(),
+                                 GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 nullptr,
+                                 OPEN_EXISTING,
+                                 FLAGS_AND_ATTRIBUTES,
+                                 nullptr);
 
   // Check GetLastError for CreateFile error code.
   if (file_handle == INVALID_HANDLE_VALUE) {
@@ -1768,7 +1788,9 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
                                                 : wfile_stat->type = "socket";
     break;
   }
-  default: { wfile_stat->type = "unknown"; }
+  default: {
+    wfile_stat->type = "unknown";
+  }
   }
 
   wfile_stat->attributes = getFileAttribStr(file_info.dwFileAttributes);
@@ -1786,7 +1808,7 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
                                          : wfile_stat->size = li.QuadPart;
 
   const char* drive_letter = nullptr;
-  auto drive_letter_index = PathGetDriveNumber(path.string().c_str());
+  auto drive_letter_index = PathGetDriveNumberW(path.wstring().c_str());
 
   if (drive_letter_index != -1 && kDriveLetters.count(drive_letter_index)) {
     drive_letter = kDriveLetters.at(drive_letter_index).c_str();
@@ -1796,11 +1818,11 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
     unsigned long free_clusters;
     unsigned long total_clusters;
 
-    if (GetDiskFreeSpace(drive_letter,
-                         &sect_per_cluster,
-                         &bytes_per_sect,
-                         &free_clusters,
-                         &total_clusters) != 0) {
+    if (GetDiskFreeSpaceA(drive_letter,
+                          &sect_per_cluster,
+                          &bytes_per_sect,
+                          &free_clusters,
+                          &total_clusters) != 0) {
       wfile_stat->block_size = bytes_per_sect;
     } else {
       wfile_stat->block_size = -1;
@@ -1822,16 +1844,19 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
   (!ret) ? wfile_stat->ctime = -1
          : wfile_stat->ctime = longIntToUnixtime(basic_info.ChangeTime);
 
+  windowsGetFileVersion(wstringToString(path.wstring()),
+                        wfile_stat->product_version);
+
   CloseHandle(file_handle);
 
-  return Status();
+  return Status::success();
 }
 
 fs::path getSystemRoot() {
-  std::vector<char> winDirectory(MAX_PATH + 1);
+  std::vector<WCHAR> winDirectory(MAX_PATH + 1);
   ZeroMemory(winDirectory.data(), MAX_PATH + 1);
-  GetWindowsDirectory(winDirectory.data(), MAX_PATH);
-  return fs::path(std::string(winDirectory.data()));
+  GetWindowsDirectoryW(winDirectory.data(), MAX_PATH);
+  return fs::path(wstringToString(winDirectory.data()));
 }
 
 Status platformLstat(const std::string& path, struct stat& d_stat) {

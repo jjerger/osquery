@@ -2,16 +2,14 @@
  *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
- *  This source code is licensed under both the Apache 2.0 license (found in the
- *  LICENSE file in the root directory of this source tree) and the GPLv2 (found
- *  in the COPYING file in the root directory of this source tree).
- *  You may select, at your option, one of the above-listed licenses.
+ *  This source code is licensed in accordance with the terms specified in
+ *  the LICENSE file found in the root directory of this source tree.
  */
 
 #include <poll.h>
 
 #include <osquery/events.h>
-#include <osquery/filesystem.h>
+#include <osquery/filesystem/filesystem.h>
 #include <osquery/logger.h>
 #include <osquery/registry_factory.h>
 
@@ -31,7 +29,7 @@ Status UdevEventPublisher::setUp() {
   // Create the udev object.
   handle_ = udev_new();
   if (handle_ == nullptr) {
-    return Status(1, "Could not create udev object.");
+    return Status::failure("Could not create udev object");
   }
 
   // Set up the udev monitor before scanning/polling.
@@ -39,11 +37,11 @@ Status UdevEventPublisher::setUp() {
   if (monitor_ == nullptr) {
     udev_unref(handle_);
     handle_ = nullptr;
-    return Status(1, "Could not create udev monitor.");
+    return Status::failure("Could not create udev monitor");
   }
 
   udev_monitor_enable_receiving(monitor_);
-  return Status(0, "OK");
+  return Status::success();
 }
 
 void UdevEventPublisher::tearDown() {
@@ -63,11 +61,11 @@ Status UdevEventPublisher::run() {
   {
     WriteLock lock(mutex_);
     if (monitor_ == nullptr) {
-      return Status(1);
+      return Status::failure("udev monitor not set up");
     }
     int fd = udev_monitor_get_fd(monitor_);
     if (fd < 0) {
-      LOG(ERROR) << "Could not get udev monitor fd";
+      LOG(ERROR) << "Could not get udev monitor fd: " << std::strerror(-fd);
       return Status::failure("udev monitor failed");
     }
 
@@ -77,19 +75,20 @@ Status UdevEventPublisher::run() {
 
     int selector = ::poll(fds, 1, 1000);
     if (selector == -1 && errno != EINTR && errno != EAGAIN) {
-      LOG(ERROR) << "Could not read udev monitor";
-      return Status(1, "udev monitor failed.");
+      LOG(ERROR) << "Could not read udev monitor: " << std::strerror(errno);
+      return Status::failure("udev monitor failed");
     }
 
     if (selector == 0 || !(fds[0].revents & POLLIN)) {
       // Read timeout.
-      return Status(0, "Finished");
+      return Status::success();
     }
 
     struct udev_device* device = udev_monitor_receive_device(monitor_);
     if (device == nullptr) {
-      LOG(ERROR) << "udev monitor returned invalid device";
-      return Status(1, "udev monitor failed.");
+      LOG(ERROR) << "udev monitor returned invalid device: "
+                 << std::strerror(errno);
+      return Status::failure("udev monitor failed");
     }
 
     auto ec = createEventContextFrom(device);
@@ -99,7 +98,7 @@ Status UdevEventPublisher::run() {
   }
 
   pause(std::chrono::milliseconds(kUdevMLatency));
-  return Status(0, "OK");
+  return Status::success();
 }
 
 std::string UdevEventPublisher::getValue(struct udev_device* device,
